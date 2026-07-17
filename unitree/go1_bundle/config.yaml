@@ -1,0 +1,23 @@
+mcp_port: 15791          # zjh 专属端口
+ros_namespace: "zjh"     # 多组隔离：topic 变 /zjh/...
+name: "Unitree Go1 (zjh test)"
+
+# 未验收的测试卡（待完成验收后迁移到上游 feat/add_unitree_go1 分支）
+plugins:
+  # ── 全传感器汇聚卡 ──
+  loco_state_zjh:              # 运动+IMU+关节+足端力/位置+电量+障碍+遥控
+    enabled: true
+
+  # ── 测试安全守护卡 ──
+  test_battery_guard_zjh:          # 低电量报警：LED+事件双通道（A通道降级：LED不可用，B通道正常：topic事件）
+    enabled: true
+    require_confirm: false
+    armed_on_start: true
+    low_soc_percent: 20
+    critical_soc_percent: 10
+
+  test_contact_check_zjh:          # 触地/悬空自检（待验收）
+    enabled: true
+    contact_force_threshold: 30.0
+    picked_up_hold_s: 0.6
+    publish_hz: 10.0
