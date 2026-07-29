@@ -29,6 +29,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
 
 import json
 import math
+import struct
 import threading
 import time
 from pathlib import Path
@@ -526,14 +527,10 @@ class CameraPlugin:
                 time.sleep(0.005)  # 5ms poll
                 continue
             try:
-                raw = bytes(msg.data)
+                # Zero-copy: np.frombuffer on array.array directly (no bytes() copy)
+                img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
                 if msg.encoding == "rgb8":
-                    img = np.frombuffer(raw, dtype=np.uint8).reshape(msg.height, msg.width, 3)
                     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                elif msg.encoding == "bgr8":
-                    img = np.frombuffer(raw, dtype=np.uint8).reshape(msg.height, msg.width, 3)
-                else:
-                    continue
                 _, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 50])
                 out = CompressedImage()
                 out.format = "jpeg"
@@ -550,6 +547,179 @@ class CameraPlugin:
         if action == "info":
             return {"state": "running", "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
         return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Additional sensors / indicators
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _JsonSensor:
+    """Small base class for a domain-0 subscription bridged as JSON on domain 42."""
+    _format = "data/json"
+
+    def _tool(self, name, description):
+        return {"name": name, "type": "sensor", "description": description,
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [{"topic": self._topic, "format": self._format}]}
+
+    def dispatch(self, action, args):
+        if action == "info":
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": self._format}]}
+        return {"state": "running" if self._running else "idle"}
+
+
+class ImuPlugin(_JsonSensor):
+    """Bridge the actual Tianyi IMU status topic to Agent Core."""
+    def __init__(self, plugin_config, namespace, ros2):
+        self._running = False
+        self._topic = f"/{namespace}/state/imu"
+        self._sub_node = Node("tianyi2_imu_sub", context=ros2.ctx_tianyi)
+        self._pub_node = Node("tianyi2_imu_pub", context=ros2.ctx_core)
+        ros2.executor_tianyi.add_node(self._sub_node)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self):
+        return self._tool("imu", "天轶2.0 IMU — 姿态、欧拉角、角速度、线加速度与错误码")
+
+    def start(self):
+        from bodyctrl_msgs.msg import Imu
+        self._running = True
+        self._sub_node.create_subscription(Imu, "/imu/status", self._on_imu, _RELIABLE_QOS)
+
+    def stop(self): self._running = False
+
+    def _on_imu(self, msg):
+        if not self._running: return
+        out = String()
+        out.data = json.dumps({"orientation": {"x": msg.orientation.x, "y": msg.orientation.y, "z": msg.orientation.z, "w": msg.orientation.w},
+                               "euler": {"roll": msg.euler.roll, "pitch": msg.euler.pitch, "yaw": msg.euler.yaw},
+                               "angular_velocity": {"x": msg.angular_velocity.x, "y": msg.angular_velocity.y, "z": msg.angular_velocity.z},
+                               "linear_acceleration": {"x": msg.linear_acceleration.x, "y": msg.linear_acceleration.y, "z": msg.linear_acceleration.z},
+                               "error": msg.error})
+        self._pub.publish(out)
+
+
+class HandStatePlugin(_JsonSensor):
+    """Bridge both Inspire hands' feedback and error arrays."""
+    def __init__(self, plugin_config, namespace, ros2):
+        self._running, self._lock = False, threading.Lock()
+        self._state = {"left": {}, "right": {}}
+        self._topic = f"/{namespace}/state/hand"
+        self._sub_node = Node("tianyi2_hand_state_sub", context=ros2.ctx_tianyi)
+        self._pub_node = Node("tianyi2_hand_state_pub", context=ros2.ctx_core)
+        ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self): return self._tool("hand_state", "天轶2.0 灵巧手状态 — 双手六指位置、速度、电流与错误码")
+    def start(self):
+        from sensor_msgs.msg import JointState
+        from std_msgs.msg import UInt32MultiArray
+        self._running = True
+        for side in ("left", "right"):
+            self._sub_node.create_subscription(JointState, f"/inspire_hand/state/{side}_hand", lambda m, s=side: self._on_state(s, m), _RELIABLE_QOS)
+            self._sub_node.create_subscription(UInt32MultiArray, f"/inspire_hand/error/{side}_hand", lambda m, s=side: self._on_error(s, m), _RELIABLE_QOS)
+    def stop(self): self._running = False
+    def _on_state(self, side, msg):
+        with self._lock:
+            self._state[side].update({"name": list(msg.name), "position": list(msg.position), "velocity": list(msg.velocity), "effort": list(msg.effort)})
+        self._publish()
+    def _on_error(self, side, msg):
+        with self._lock: self._state[side]["errors"] = list(msg.data)
+        self._publish()
+    def _publish(self):
+        if not self._running: return
+        with self._lock: data = json.dumps(self._state)
+        out = String(); out.data = data; self._pub.publish(out)
+
+
+class DepthCameraPlugin:
+    """Forward the Orbbec Z16 depth image without conversion or re-encoding."""
+    def __init__(self, plugin_config, namespace, ros2):
+        self._running = False; self._topic = f"/{namespace}/camera/head/depth"
+        self._sub_node = Node("tianyi2_depth_sub", context=ros2.ctx_tianyi)
+        self._pub_node = Node("tianyi2_depth_pub", context=ros2.ctx_core)
+        ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
+    def get_tool(self):
+        return {"name": "camera_depth", "type": "sensor", "description": "天轶2.0 Orbbec 头部深度图（Z16）",
+                "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
+    def start(self):
+        from sensor_msgs.msg import Image
+        self._running = True; self._pub = self._pub_node.create_publisher(Image, self._topic, _LOW_LAT_QOS)
+        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_image, _RELIABLE_QOS)
+    def stop(self): self._running = False
+    def _on_image(self, msg):
+        if self._running and msg.encoding in ("16UC1", "mono16"): self._pub.publish(msg)
+    def dispatch(self, action, args):
+        return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
+
+
+class PointCloudPlugin:
+    """Pack native PointCloud2, or derive XYZ from the active depth stream."""
+    _format = "sensor/pointcloud"
+    def __init__(self, plugin_config, namespace, ros2):
+        self._running = False; self._topic = f"/{namespace}/camera/head/points"; self._last = 0.0; self._intrinsics = None
+        self._sub_node = Node("tianyi2_points_sub", context=ros2.ctx_tianyi); self._pub_node = Node("tianyi2_points_pub", context=ros2.ctx_core)
+        ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
+    def get_tool(self):
+        return {"name": "camera_pointcloud", "type": "sensor", "description": "天轶2.0 Orbbec 头部彩色点云（限频、限点）", "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": self._format}]}
+    def start(self):
+        from sensor_msgs.msg import PointCloud2, Image, CameraInfo
+        from std_msgs.msg import UInt8MultiArray
+        self._running = True; self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
+        self._sub_node.create_subscription(PointCloud2, "/ob_camera_head/depth/points", self._on_cloud, _LOW_LAT_QOS)
+        # Gemini 336 currently has its depth image enabled even when the vendor
+        # point-cloud stream is disabled.  This fallback keeps the card live.
+        self._sub_node.create_subscription(CameraInfo, "/ob_camera_head/depth/camera_info", self._on_info, _RELIABLE_QOS)
+        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_depth, _LOW_LAT_QOS)
+    def stop(self): self._running = False
+    def _on_cloud(self, msg):
+        if not self._running or time.monotonic() - self._last < 0.5: return
+        fields = {f.name: f.offset for f in msg.fields}
+        if not all(k in fields for k in ("x", "y", "z")): return
+        self._last = time.monotonic(); raw = bytes(msg.data); count = min(msg.width * msg.height, 10000)
+        packed = bytearray(struct.pack("<II", 12, count))
+        for i in range(count):
+            base = i * msg.point_step
+            packed.extend(raw[base + fields["x"]:base + fields["x"] + 4]); packed.extend(raw[base + fields["y"]:base + fields["y"] + 4]); packed.extend(raw[base + fields["z"]:base + fields["z"] + 4])
+        from std_msgs.msg import UInt8MultiArray
+        out = UInt8MultiArray(); out.data = list(packed); self._pub.publish(out)
+    def _on_info(self, msg): self._intrinsics = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
+    def _on_depth(self, msg):
+        if not self._running or self._intrinsics is None or time.monotonic() - self._last < 0.5: return
+        if msg.encoding not in ("16UC1", "mono16"): return
+        fx, fy, cx, cy = self._intrinsics
+        if fx <= 0 or fy <= 0: return
+        self._last = time.monotonic(); raw = bytes(msg.data); step = max(1, int(math.sqrt((msg.width * msg.height) / 10000)))
+        packed = bytearray(); count = 0
+        for v in range(0, msg.height, step):
+            for u in range(0, msg.width, step):
+                d = struct.unpack_from("<H", raw, v * msg.step + u * 2)[0]
+                if d == 0: continue
+                z = d / 1000.0; packed.extend(struct.pack("<fff", (u - cx) * z / fx, (v - cy) * z / fy, z)); count += 1
+        if not count: return
+        from std_msgs.msg import UInt8MultiArray
+        out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)
+    def dispatch(self, action, args): return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": self._format}]}
+
+
+class LightPlugin:
+    """Safe semantic system-light control; no raw vendor command is exposed."""
+    _commands = {"standby": 99, "service_wait": 20, "service_ready": 22, "warning": 12, "warning_clear": 13, "error": 10, "error_clear": 11}
+    def __init__(self, plugin_config, namespace, ros2):
+        self._pub_node = Node("tianyi2_light_pub", context=ros2.ctx_tianyi); ros2.executor_tianyi.add_node(self._pub_node); self._pub = None
+    def get_tool(self):
+        return {"name": "light", "type": "actuator", "description": "天轶2.0 系统状态灯效", "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": list(self._commands)}}, "required": ["action"], "x-action-params": {k: {"params": [], "description": k} for k in self._commands}}}
+    def start(self):
+        from bodyctrl_msgs.msg import LightCtrl
+        self._pub = self._pub_node.create_publisher(LightCtrl, "/xsys/light/ctrl", _RELIABLE_QOS)
+    def stop(self): pass
+    def dispatch(self, action, args):
+        if action not in self._commands: return {"error": f"unknown action: {action}"}
+        from bodyctrl_msgs.msg import LightCtrl
+        msg = LightCtrl(); msg.cmd = self._commands[action]; msg.caller_id = "phanthy-motus"; msg.caller_msg = f"Agent Core: {action}"; self._pub.publish(msg)
+        return {"state": action}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -982,12 +1152,12 @@ class WaistPlugin:
             for mid, deg in [(31, yaw_deg), (32, pitch_deg)]:
                 lim = _JOINT_LIMITS[mid]
                 pos, clamped = _clamp(deg, lim[0], lim[1])
-                spd_rpm, _ = _clamp(30.0, 0, lim[2])
+                spd, _ = _clamp(0.5, 0, _rpm2rads(lim[2]))
                 cur, _ = _clamp(5.0, 0, lim[3])
                 cmd = SetMotorPosition()
                 cmd.name = mid
                 cmd.pos = _deg2rad(pos)
-                cmd.spd = spd_rpm
+                cmd.spd = spd
                 cmd.cur = cur
                 msg.cmds.append(cmd)
                 results.append({"name": _ALL_JOINTS[mid], "pos": pos})
