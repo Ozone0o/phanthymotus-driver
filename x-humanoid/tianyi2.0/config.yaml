@@ -14,13 +14,9 @@ plugins:
     enabled: true
   imu:
     enabled: true
-  hand_state:
-    enabled: true
   camera_depth:
     enabled: true
   camera_pointcloud:
-    enabled: true
-  light:
     enabled: true
   asr:
     enabled: true

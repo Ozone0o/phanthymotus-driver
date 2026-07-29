@@ -107,14 +107,13 @@ class TianyiDeviceBundle:
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
             print("[bundle] CameraPlugin loaded")
 
-        for config_name, class_name in (("imu", "ImuPlugin"), ("hand_state", "HandStatePlugin"),
+        for config_name, class_name in (("imu", "ImuPlugin"),
                                         ("camera_depth", "DepthCameraPlugin"),
-                                        ("camera_pointcloud", "PointCloudPlugin"), ("light", "LightPlugin")):
+                                        ("camera_pointcloud", "PointCloudPlugin")):
             if plugins_cfg.get(config_name, {}).get("enabled", False):
-                from device import ImuPlugin, HandStatePlugin, DepthCameraPlugin, PointCloudPlugin, LightPlugin
-                plugin_class = {"ImuPlugin": ImuPlugin, "HandStatePlugin": HandStatePlugin,
-                                "DepthCameraPlugin": DepthCameraPlugin, "PointCloudPlugin": PointCloudPlugin,
-                                "LightPlugin": LightPlugin}[class_name]
+                from device import ImuPlugin, DepthCameraPlugin, PointCloudPlugin
+                plugin_class = {"ImuPlugin": ImuPlugin, "DepthCameraPlugin": DepthCameraPlugin,
+                                "PointCloudPlugin": PointCloudPlugin}[class_name]
                 self._plugins.append(plugin_class(plugins_cfg[config_name], namespace, ros2))
                 print(f"[bundle] {class_name} loaded")
 
