@@ -162,6 +162,16 @@ class TianyiDeviceBundle:
             self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
             print("[bundle] ChatPlugin loaded")
 
+        if plugins_cfg.get("lyre_event", {}).get("enabled", False):
+            from device import LyreEventPlugin
+            self._plugins.append(LyreEventPlugin(plugins_cfg["lyre_event"], namespace, ros2))
+            print("[bundle] LyreEventPlugin loaded")
+
+        if plugins_cfg.get("llm", {}).get("enabled", False):
+            from device import LlmPlugin
+            self._plugins.append(LlmPlugin(plugins_cfg["llm"], namespace, ros2))
+            print("[bundle] LlmPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:

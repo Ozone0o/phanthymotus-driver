@@ -36,3 +36,7 @@ plugins:
     enabled: true
   chat:
     enabled: true
+  lyre_event:
+    enabled: true
+  llm:
+    enabled: true

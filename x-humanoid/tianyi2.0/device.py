@@ -839,6 +839,134 @@ class AsrPlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# LyreEventPlugin (sensor) — lyre 语音包事件/状态采集
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LyreEventPlugin:
+    """lyre 语音包事件采集 — 唤醒词/ASR事件/播放事件/播放进度/TTS事件"""
+
+    _ASR_EVENT_NAMES = {2: "error", 3: "state", 4: "wakeup", 5: "sleep",
+                        6: "vad", 10: "pre_sleep", 13: "connected", 14: "disconnected"}
+    _PLAY_EVENT_NAMES = {0: "started", 1: "completed", 2: "stopped", 3: "cancelled", 4: "failed"}
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._running = False
+
+        self._sub_node = Node("tianyi2_lyre_event_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._pub_node = Node("tianyi2_lyre_event_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+
+        self._topics = {
+            "lyre_keyword": f"/{namespace}/lyre/keyword",
+            "lyre_asr_event": f"/{namespace}/lyre/asr_event",
+            "lyre_play_event": f"/{namespace}/lyre/play_event",
+            "lyre_play_progress": f"/{namespace}/lyre/play_progress",
+            "lyre_tts_event": f"/{namespace}/lyre/tts_event",
+        }
+        self._pubs = {}
+
+    def get_tools(self) -> list:
+        return [
+            {"name": "lyre_keyword", "type": "sensor",
+             "description": "天轶2.0 语音唤醒关键词 — 检测到的唤醒词及声源角度",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": [{"topic": self._topics["lyre_keyword"], "format": "data/json"}]},
+            {"name": "lyre_asr_event", "type": "sensor",
+             "description": "天轶2.0 ASR 状态事件 — 唤醒/休眠/VAD/连接状态",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": [{"topic": self._topics["lyre_asr_event"], "format": "data/json"}]},
+            {"name": "lyre_play_event", "type": "sensor",
+             "description": "天轶2.0 音频播放事件 — 开始/完成/停止/取消/失败",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": [{"topic": self._topics["lyre_play_event"], "format": "data/json"}]},
+            {"name": "lyre_play_progress", "type": "sensor",
+             "description": "天轶2.0 音频播放进度 — 当前位置和总时长(秒)",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": [{"topic": self._topics["lyre_play_progress"], "format": "data/json"}]},
+            {"name": "lyre_tts_event", "type": "sensor",
+             "description": "天轶2.0 TTS 合成事件 — 合成开始/完成/停止/取消/失败",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": [{"topic": self._topics["lyre_tts_event"], "format": "data/json"}]},
+        ]
+
+    def start(self):
+        self._running = True
+        for key, topic in self._topics.items():
+            self._pubs[key] = self._pub_node.create_publisher(String, topic, _RELIABLE_QOS)
+
+        try:
+            from lyre_msgs.msg import AsrKeyword, AsrEvent, PlayEvent, PlayProgress, TtsEvent
+            self._sub_node.create_subscription(
+                AsrKeyword, "/audio_asr/keyword", self._on_keyword, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                AsrEvent, "/audio_asr/event", self._on_asr_event, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                PlayEvent, "/audio_play/event", self._on_play_event, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                PlayProgress, "/audio_play/progress", self._on_play_progress, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                TtsEvent, "/audio_tts/event", self._on_tts_event, _RELIABLE_QOS)
+            print("[LyreEventPlugin] 5 subscriptions created")
+        except ImportError:
+            print("[LyreEventPlugin] WARNING: lyre_msgs not available, no subscriptions created")
+
+    def stop(self):
+        self._running = False
+
+    def _publish(self, key: str, data: dict):
+        if not self._running:
+            return
+        out = String()
+        out.data = json.dumps(data)
+        self._pubs[key].publish(out)
+
+    def _on_keyword(self, msg):
+        self._publish("lyre_keyword", {"keyword": msg.keyword, "angle": msg.angle})
+
+    def _on_asr_event(self, msg):
+        self._publish("lyre_asr_event", {
+            "event": msg.event,
+            "event_name": self._ASR_EVENT_NAMES.get(msg.event, f"unknown_{msg.event}"),
+            "arg1": msg.arg1, "arg2": msg.arg2,
+        })
+
+    def _on_play_event(self, msg):
+        self._publish("lyre_play_event", {
+            "sid": msg.sid, "seq": msg.seq,
+            "event": msg.event,
+            "event_name": self._PLAY_EVENT_NAMES.get(msg.event, f"unknown_{msg.event}"),
+            "message": msg.message,
+        })
+
+    def _on_play_progress(self, msg):
+        self._publish("lyre_play_progress", {
+            "sid": msg.sid, "seq": msg.seq,
+            "position": msg.position, "duration": msg.duration,
+        })
+
+    def _on_tts_event(self, msg):
+        self._publish("lyre_tts_event", {
+            "sid": msg.sid, "seq": msg.seq,
+            "event": msg.event,
+            "event_name": self._PLAY_EVENT_NAMES.get(msg.event, f"unknown_{msg.event}"),
+            "message": msg.message,
+        })
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        tool_name = args.get("_tool_name", "lyre_keyword")
+        if tool_name not in self._topics:
+            return {"error": f"unknown tool: {tool_name}"}
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topics[tool_name], "format": "data/json"}]}
+        return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # NavStatePlugin (sensor)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1624,3 +1752,138 @@ class ChatPlugin:
         elif action == "stop":
             return {"state": "idle"}
         return {"error": f"unknown action: {action}"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LlmPlugin (actuator + sensor) — LLM 语音对话
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LlmPlugin:
+    """LLM 语音对话 — 向大模型提问并获取回复"""
+
+    _LLM_EVENT_NAMES = {0: "started", 1: "completed", 2: "stopped", 3: "cancelled", 4: "failed"}
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._running = False
+
+        self._srv_node = Node("tianyi2_llm_srv", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._srv_node)
+        self._ask_client = None
+
+        self._sub_node = Node("tianyi2_llm_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+        self._pub_node = Node("tianyi2_llm_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+
+        self._topic_rst = f"/{namespace}/lyre/llm_rst"
+        self._topic_event = f"/{namespace}/lyre/llm_event"
+        self._pub_rst = None
+        self._pub_event = None
+
+    def get_tools(self) -> list:
+        return [
+            {"name": "llm_ask", "type": "actuator",
+             "description": "天轶2.0 LLM 语音对话 — 向大模型发送文本问题",
+             "inputSchema": {
+                 "type": "object",
+                 "properties": {
+                     "action": {"type": "string", "enum": ["ask"], "description": "发送问题"},
+                     "text": {"type": "string", "description": "要发送的问题文本"},
+                     "id": {"type": "string", "description": "可选标识符，关联 ASR 识别 ID"},
+                 },
+                 "required": ["action", "text"],
+                 "x-action-params": {
+                     "ask": {"params": ["text", "id"], "description": "向 LLM 提问"},
+                 },
+             }},
+            {"name": "llm_rst", "type": "sensor",
+             "description": "天轶2.0 LLM 语音对话结果 — 大模型返回的文本回复",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": [{"topic": self._topic_rst, "format": "data/json"}]},
+            {"name": "llm_event", "type": "sensor",
+             "description": "天轶2.0 LLM 语音对话事件 — 开始/完成/停止/取消/失败",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": [{"topic": self._topic_event, "format": "data/json"}]},
+        ]
+
+    def start(self):
+        self._running = True
+        self._pub_rst = self._pub_node.create_publisher(String, self._topic_rst, _RELIABLE_QOS)
+        self._pub_event = self._pub_node.create_publisher(String, self._topic_event, _RELIABLE_QOS)
+
+        try:
+            from lyre_msgs.srv import LlmAsk
+            from lyre_msgs.msg import LlmRst, LlmEvent
+            self._ask_client = self._srv_node.create_client(LlmAsk, "/audio_llm/ask")
+            self._sub_node.create_subscription(
+                LlmRst, "/audio_llm/rst", self._on_llm_rst, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                LlmEvent, "/audio_llm/event", self._on_llm_event, _RELIABLE_QOS)
+            print("[LlmPlugin] service client + 2 subscriptions created")
+        except ImportError as e:
+            print(f"[LlmPlugin] WARNING: lyre_msgs import failed ({e})")
+
+    def stop(self):
+        self._running = False
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        tool_name = args.get("_tool_name", "llm_ask")
+
+        if tool_name == "llm_ask":
+            if action == "ask":
+                text = args.get("text", "")
+                qid = args.get("id", "")
+                if not text:
+                    return {"error": "text is required"}
+                return self._ask(text, qid)
+            elif action in ("start", "info"):
+                return {"state": "ready"}
+            return {"error": f"unknown action: {action}"}
+
+        elif tool_name == "llm_rst":
+            if action in ("start", "stop", "info"):
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._topic_rst, "format": "data/json"}]}
+            return {"state": "running"}
+
+        elif tool_name == "llm_event":
+            if action in ("start", "stop", "info"):
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._topic_event, "format": "data/json"}]}
+            return {"state": "running"}
+
+        return {"error": f"unknown tool: {tool_name}"}
+
+    def _ask(self, text: str, qid: str) -> dict:
+        if not self._ask_client:
+            return {"error": "llm_ask service client not initialized"}
+        try:
+            from lyre_msgs.srv import LlmAsk
+            req = LlmAsk.Request()
+            req.text = text
+            req.id = qid
+            future = self._ask_client.call_async(req)
+            return {"state": "asking", "text": text[:100]}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _on_llm_rst(self, msg):
+        if not self._running:
+            return
+        out = String()
+        out.data = json.dumps({"sid": msg.sid, "seq": msg.seq, "last": msg.last, "text": msg.text})
+        self._pub_rst.publish(out)
+
+    def _on_llm_event(self, msg):
+        if not self._running:
+            return
+        out = String()
+        out.data = json.dumps({
+            "sid": msg.sid, "seq": msg.seq,
+            "event": msg.event,
+            "event_name": self._LLM_EVENT_NAMES.get(msg.event, f"unknown_{msg.event}"),
+            "message": msg.message,
+        })
+        self._pub_event.publish(out)
