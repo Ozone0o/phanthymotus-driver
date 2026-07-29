@@ -1152,12 +1152,12 @@ class WaistPlugin:
             for mid, deg in [(31, yaw_deg), (32, pitch_deg)]:
                 lim = _JOINT_LIMITS[mid]
                 pos, clamped = _clamp(deg, lim[0], lim[1])
-                spd, _ = _clamp(0.5, 0, _rpm2rads(lim[2]))
+                spd_rpm, _ = _clamp(30.0, 0, lim[2])
                 cur, _ = _clamp(5.0, 0, lim[3])
                 cmd = SetMotorPosition()
                 cmd.name = mid
                 cmd.pos = _deg2rad(pos)
-                cmd.spd = spd
+                cmd.spd = spd_rpm
                 cmd.cur = cur
                 msg.cmds.append(cmd)
                 results.append({"name": _ALL_JOINTS[mid], "pos": pos})
