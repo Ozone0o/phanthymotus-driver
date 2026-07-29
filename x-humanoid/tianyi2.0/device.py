@@ -93,6 +93,63 @@ _LEG_JOINTS = {
 
 _ALL_JOINTS = {**_HEAD_JOINTS, **_ARM_LEFT_JOINTS, **_ARM_RIGHT_JOINTS, **_WAIST_JOINTS, **_LEG_JOINTS}
 
+# ── 关节限位 (deg, rpm, A): motor_id → (min_deg, max_deg, max_spd_rpm, rated_current_a) ─
+
+_JOINT_LIMITS = {
+    # 头部
+    1:  (-26,    26,    64,  5.0),
+    2:  (-25,    25,    64,  5.0),
+    3:  (-90,    90,    64,  5.0),
+    # 左臂
+    11: (-170,   170,   88,  35.0),
+    12: (-15,    150,   120, 23.0),
+    13: (-170,   170,   73,  8.0),
+    14: (-150,   15,    73,  8.0),
+    15: (-170,   170,   146, 8.0),
+    16: (-45,    60,    72,  5.0),
+    17: (-95,    75,    72,  5.0),
+    # 右臂
+    21: (-170,   170,   88,  35.0),
+    22: (-150,   15,    120, 23.0),
+    23: (-170,   170,   73,  8.0),
+    24: (-150,   15,    73,  8.0),
+    25: (-170,   170,   146, 8.0),
+    26: (-45,    60,    72,  5.0),
+    27: (-75,    95,    72,  5.0),
+    # 腰部
+    31: (-160,   180,   30,  31.0),
+    32: (-45,    120,   37.5, 82.0),
+    # 左腿
+    51: (-13,    80,    37.5, 35.0),
+    52: (-26,    160,   37.5, 35.0),
+}
+
+
+def _rpm2rads(rpm: float) -> float:
+    return rpm * 2.0 * math.pi / 60.0
+
+
+def _clamp(val: float, lo: float, hi: float) -> tuple:
+    """Clamp value to [lo, hi]; returns (clamped_value, was_clamped)."""
+    if val < lo:
+        return lo, True
+    if val > hi:
+        return hi, True
+    return val, False
+
+
+def _resolve_motor_id(identifier, valid_ids: list) -> int | None:
+    """将关节标识符（int ID 或 str 名称）解析为 motor ID。"""
+    if isinstance(identifier, int):
+        return identifier if identifier in valid_ids else None
+    if isinstance(identifier, str):
+        s = identifier.strip().lower()
+        for mid in valid_ids:
+            name = _ALL_JOINTS.get(mid, "")
+            if s == name or s == str(mid):
+                return mid
+    return None
+
 
 def _deg2rad(deg: float) -> float:
     return deg * math.pi / 180.0
@@ -1026,32 +1083,37 @@ class ArmPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class WaistPlugin:
-    """腰部2DOF控制 (yaw/pitch)"""
+    """腰部2DOF — set_pos / set_zero (不支持 KP/KD)"""
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
-        self._pub_node = Node("tianyi2_waist_pub", context=ros2.ctx_tianyi)
+        self._pub_node = Node("tianyi2_waist_cmd", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._pub_node)
-        self._publisher = None
+        self._pub_pos = None
+        self._pub_zero = None
 
     def get_tool(self) -> dict:
         return {
             "name": "waist",
             "type": "actuator",
-            "description": "天轶2.0 腰部控制 — 2DOF (yaw±160°, pitch -45°~120°)",
+            "description": "天轶2.0 腰部控制 — 2DOF (yaw: -160°~180°, pitch: -45°~120°), 仅位置+标零",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move_pos"],
-                               "description": "控制动作"},
-                    "yaw": {"type": "number", "description": "偏航角(度), 范围[-160, 180]"},
-                    "pitch": {"type": "number", "description": "俯仰角(度), 范围[-45, 120]"},
+                    "action": {"type": "string", "enum": ["move_pos", "set_zero"],
+                               "description": "控制模式"},
+                    "yaw": {"type": "number", "description": "偏航角(度), 左正右负, 范围[-160, 180]"},
+                    "pitch": {"type": "number", "description": "俯仰角(度), 前正后负, 范围[-45, 120]"},
+                    "joint_id": {"type": "integer", "enum": [31],
+                                 "description": "标零关节ID (31=waist_yaw)"},
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "move_pos": {"params": ["yaw", "pitch"],
-                                 "description": "移动腰部到指定角度"},
+                                 "description": "移动腰部到指定角度(度), 不传默认0"},
+                    "set_zero": {"params": ["joint_id"],
+                                 "description": "关节标零"},
                 },
             },
         }
@@ -1059,45 +1121,65 @@ class WaistPlugin:
     def start(self):
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition
-            self._publisher = self._pub_node.create_publisher(
-                CmdSetMotorPosition, "/waist/cmd_pos", _RELIABLE_QOS)
-            print("[WaistPlugin] publisher created")
+            from std_msgs.msg import String as StdString
+            self._pub_pos  = self._pub_node.create_publisher(CmdSetMotorPosition, "/waist/cmd_pos", _RELIABLE_QOS)
+            self._pub_zero = self._pub_node.create_publisher(StdString, "/waist/cmd_set_zero", _RELIABLE_QOS)
+            print("[WaistPlugin] publishers created")
         except ImportError as e:
-            print(f"[WaistPlugin] WARNING: msg import failed ({e})")
+            print(f"[WaistPlugin] WARNING: {e}")
 
     def stop(self):
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "move_pos":
-            yaw = args.get("yaw", 0)
-            pitch = args.get("pitch", 0)
-            return self._send_pos(yaw, pitch)
-        elif action in ("start", "info"):
+            return self._send_pos(args.get("yaw", 0), args.get("pitch", 0))
+        if action == "set_zero":
+            return self._send_zero(args.get("joint_id", 31))
+        if action in ("start", "info"):
             return {"state": "ready"}
-        elif action == "stop":
+        if action == "stop":
             return {"state": "idle"}
-        return {"error": f"unknown action: {action}"}
+        return {"ok": False, "code": "INVALID_ARGUMENT", "message": f"unknown action: {action}"}
 
     def _send_pos(self, yaw_deg: float, pitch_deg: float) -> dict:
-        if not self._publisher:
-            return {"error": "publisher not initialized"}
+        if not self._pub_pos:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
             msg = CmdSetMotorPosition()
-            cmds = []
-            for motor_id, deg in [(31, yaw_deg), (32, pitch_deg)]:
+            results = []
+            for mid, deg in [(31, yaw_deg), (32, pitch_deg)]:
+                lim = _JOINT_LIMITS[mid]
+                pos, clamped = _clamp(deg, lim[0], lim[1])
+                spd, _ = _clamp(0.5, 0, _rpm2rads(lim[2]))
+                cur, _ = _clamp(5.0, 0, lim[3])
                 cmd = SetMotorPosition()
-                cmd.name = motor_id
-                cmd.pos = _deg2rad(deg)
-                cmd.spd = 0.5  # rad/s
-                cmd.cur = 10.0  # A
-                cmds.append(cmd)
-            msg.cmds = cmds
-            self._publisher.publish(msg)
-            return {"state": "moving", "yaw": yaw_deg, "pitch": pitch_deg}
+                cmd.name = mid
+                cmd.pos = _deg2rad(pos)
+                cmd.spd = spd
+                cmd.cur = cur
+                msg.cmds.append(cmd)
+                results.append({"name": _ALL_JOINTS[mid], "pos": pos})
+                if clamped:
+                    return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
+                            "message": f"waist joint {mid} ({_ALL_JOINTS[mid]}) pos out of range [{lim[0]}°, {lim[1]}°]"}
+            self._pub_pos.publish(msg)
+            return {"ok": True, "card": "waist", "action": "move_pos", "applied": results}
         except Exception as e:
-            return {"error": str(e)}
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
+
+    def _send_zero(self, joint_id: int) -> dict:
+        if not self._pub_zero:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
+        if joint_id not in [31]:
+            return {"ok": False, "code": "INVALID_ARGUMENT",
+                    "message": f"No valid waist joint ID (valid: [31]), got: {joint_id}"}
+        from std_msgs.msg import String as StdString
+        msg = StdString(); msg.data = str(joint_id)
+        self._pub_zero.publish(msg)
+        return {"ok": True, "card": "waist", "action": "set_zero",
+                "applied": [{"id": joint_id, "name": _ALL_JOINTS[joint_id]}]}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
