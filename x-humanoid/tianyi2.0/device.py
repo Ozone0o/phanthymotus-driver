@@ -570,10 +570,12 @@ class _JsonSensor:
 
 
 class ImuPlugin(_JsonSensor):
-    """Bridge the actual Tianyi IMU status topic to Agent Core."""
+    """Bridge Tianyi's vendor and standard ROS IMU streams to Agent Core."""
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False
         self._topic = f"/{namespace}/state/imu"
+        self._last_pub = 0.0
+        self._subscriptions = []  # Keep rclpy subscriptions alive for the plugin lifetime.
         self._sub_node = Node("tianyi2_imu_sub", context=ros2.ctx_tianyi)
         self._pub_node = Node("tianyi2_imu_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node)
@@ -584,21 +586,71 @@ class ImuPlugin(_JsonSensor):
         return self._tool("imu", "天轶2.0 IMU — 姿态、欧拉角、角速度、线加速度与错误码")
 
     def start(self):
+        """Subscribe to both IMU interfaces used by Tianyi deployments.
+
+        The body controller publishes ``bodyctrl_msgs/Imu`` on ``/imu/status``
+        on some images, while other images expose the standard
+        ``sensor_msgs/Imu`` stream on ``/imu/data``.  Sensor publishers are
+        normally BEST_EFFORT, so a reliable subscription silently receives no
+        samples.  The low-latency QoS matches either sensor stream.
+        """
         from bodyctrl_msgs.msg import Imu
+        from sensor_msgs.msg import Imu as RosImu
         self._running = True
-        self._sub_node.create_subscription(Imu, "/imu/status", self._on_imu, _RELIABLE_QOS)
+        self._subscriptions = [
+            self._sub_node.create_subscription(
+                Imu, "/imu/status", self._on_vendor_imu, _LOW_LAT_QOS),
+            self._sub_node.create_subscription(
+                RosImu, "/imu/data", self._on_ros_imu, _LOW_LAT_QOS),
+        ]
+        print("[ImuPlugin] subscribed: /imu/status (bodyctrl_msgs/Imu), /imu/data (sensor_msgs/Imu)")
 
-    def stop(self): self._running = False
+    def stop(self):
+        self._running = False
 
-    def _on_imu(self, msg):
-        if not self._running: return
+    def _publish(self, orientation, angular_velocity, linear_acceleration, euler, error=0):
+        # The dashboard only needs the latest state.  Bound forwarding to 30 Hz
+        # so a high-rate IMU cannot congest the domain-42 bridge.
+        now = time.monotonic()
+        if not self._running or now - self._last_pub < 1.0 / 30.0:
+            return
+        self._last_pub = now
         out = String()
-        out.data = json.dumps({"orientation": {"x": msg.orientation.x, "y": msg.orientation.y, "z": msg.orientation.z, "w": msg.orientation.w},
-                               "euler": {"roll": msg.euler.roll, "pitch": msg.euler.pitch, "yaw": msg.euler.yaw},
-                               "angular_velocity": {"x": msg.angular_velocity.x, "y": msg.angular_velocity.y, "z": msg.angular_velocity.z},
-                               "linear_acceleration": {"x": msg.linear_acceleration.x, "y": msg.linear_acceleration.y, "z": msg.linear_acceleration.z},
-                               "error": msg.error})
+        out.data = json.dumps({
+            "orientation": orientation,
+            "euler": euler,
+            "angular_velocity": angular_velocity,
+            "linear_acceleration": linear_acceleration,
+            "error": error,
+        })
         self._pub.publish(out)
+
+    def _on_vendor_imu(self, msg):
+        self._publish(
+            {"x": msg.orientation.x, "y": msg.orientation.y, "z": msg.orientation.z, "w": msg.orientation.w},
+            {"x": msg.angular_velocity.x, "y": msg.angular_velocity.y, "z": msg.angular_velocity.z},
+            {"x": msg.linear_acceleration.x, "y": msg.linear_acceleration.y, "z": msg.linear_acceleration.z},
+            {"roll": msg.euler.roll, "pitch": msg.euler.pitch, "yaw": msg.euler.yaw},
+            msg.error,
+        )
+
+    def _on_ros_imu(self, msg):
+        q = msg.orientation
+        # Standard sensor_msgs/Imu has no Euler field; derive it from its
+        # quaternion so both source topics produce the same card payload.
+        sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z)
+        cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+        sinp = 2.0 * (q.w * q.y - q.z * q.x)
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self._publish(
+            {"x": q.x, "y": q.y, "z": q.z, "w": q.w},
+            {"x": msg.angular_velocity.x, "y": msg.angular_velocity.y, "z": msg.angular_velocity.z},
+            {"x": msg.linear_acceleration.x, "y": msg.linear_acceleration.y, "z": msg.linear_acceleration.z},
+            {"roll": math.atan2(sinr_cosp, cosr_cosp),
+             "pitch": math.asin(max(-1.0, min(1.0, sinp))),
+             "yaw": math.atan2(siny_cosp, cosy_cosp)},
+        )
 
 
 class HandStatePlugin(_JsonSensor):

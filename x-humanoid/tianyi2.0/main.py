@@ -332,7 +332,7 @@ def main():
 
     cfg       = _load_config()
     namespace = _resolve_namespace(cfg)
-    mcp_port  = int(cfg.get("mcp_port", 15707))
+    mcp_port  = int(cfg.get("mcp_port", 15708))
     _server_name = cfg.get("mcp_server_name", "tianyi2-device-bundle")
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
