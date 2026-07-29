@@ -21,6 +21,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   HeadPlugin       (actuator)           — 头部3DOF控制
   ArmPlugin        (actuator)           — 双臂14DOF控制
   WaistPlugin      (actuator)           — 腰部2DOF控制
+  LegPlugin        (actuator)           — 腿部2DOF控制
   HandPlugin       (actuator)           — 灵巧手控制
   TtsPlugin        (actuator)           — 语音合成
   NavPlugin        (actuator)           — 底盘导航控制
@@ -1519,6 +1520,103 @@ class WaistPlugin:
         except Exception as e:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LegPlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LegPlugin:
+    """腿部2DOF — move_pos / set_zero (不支持 KP/KD)
+
+    调用格式:
+      - 位置控制: {"action": "move_pos", "hip": 30, "knee": 60, "speed": 0.5, "current": 10.0}
+      - 标零:   {"action": "set_zero"}  (等价于 move_pos hip=0, knee=0)
+    """
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._pub_node = Node("tianyi2_leg_cmd", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._pub_pos = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "leg",
+            "type": "actuator",
+            "description": "天轶2.0 腿部控制 — 2DOF (hip: -13°~80°, knee: -26°~160°), 位置控制/标零",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["move_pos", "set_zero"],
+                               "description": "控制模式"},
+                    "hip": {"type": "number", "description": "髋关节俯仰角(度), 范围[-13, 80], 默认0"},
+                    "knee": {"type": "number", "description": "膝关节俯仰角(度), 范围[-26, 160], 默认0"},
+                    "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
+                    "current": {"type": "number", "description": "最大电流(A), 默认10.0"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "move_pos": {"params": ["hip", "knee", "speed", "current"],
+                                 "description": "位置模式: 移动腿部到指定角度(度)"},
+                    "set_zero": {"params": [],
+                                 "description": "标零: 等价于 move_pos hip=0, knee=0"},
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition
+            self._pub_pos = self._pub_node.create_publisher(CmdSetMotorPosition, "/leg/cmd_pos", _RELIABLE_QOS)
+            print("[LegPlugin] publisher created (/leg/cmd_pos)")
+        except ImportError as e:
+            print(f"[LegPlugin] WARNING: {e}")
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "move_pos":
+            return self._send_pos(
+                args.get("hip", 0), args.get("knee", 0),
+                args.get("speed", 0.5), args.get("current", 10.0))
+        if action == "set_zero":
+            return self._send_pos(0, 0)
+        if action in ("start", "info"):
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        return {"ok": False, "code": "INVALID_ARGUMENT", "message": f"unknown action: {action}"}
+
+    def _send_pos(self, hip_deg: float, knee_deg: float, speed_rad_s: float = 0.5, current_a: float = 10.0) -> dict:
+        if not self._pub_pos:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+            msg = CmdSetMotorPosition()
+            results = []
+            for mid, deg in [(51, hip_deg), (52, knee_deg)]:
+                lim = _JOINT_LIMITS[mid]
+                pos_deg, clamped = _clamp(deg, lim[0], lim[1])
+                max_spd_rads = _rpm2rads(lim[2])
+                spd, _ = _clamp(speed_rad_s, 0, max_spd_rads)
+                cur, _ = _clamp(current_a, 0, lim[3])
+                cmd = SetMotorPosition()
+                cmd.name = mid
+                cmd.pos = _deg2rad(pos_deg)
+                cmd.spd = spd
+                cmd.cur = cur
+                msg.cmds.append(cmd)
+                results.append({"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd, "cur_a": cur})
+                if clamped:
+                    return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
+                            "message": f"leg joint {mid} ({_ALL_JOINTS[mid]}) pos_deg out of range [{lim[0]}°, {lim[1]}°]"}
+            self._pub_pos.publish(msg)
+            return {"ok": True, "card": "leg", "action": "move_pos", "applied": results}
+        except Exception as e:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

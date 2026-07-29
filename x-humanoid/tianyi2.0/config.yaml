@@ -28,6 +28,8 @@ plugins:
     enabled: true
   waist:
     enabled: true
+  leg:
+    enabled: true
   hand:
     enabled: true
   tts:

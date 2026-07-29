@@ -142,6 +142,11 @@ class TianyiDeviceBundle:
             self._plugins.append(WaistPlugin(plugins_cfg["waist"], namespace, ros2))
             print("[bundle] WaistPlugin loaded")
 
+        if plugins_cfg.get("leg", {}).get("enabled", False):
+            from device import LegPlugin
+            self._plugins.append(LegPlugin(plugins_cfg["leg"], namespace, ros2))
+            print("[bundle] LegPlugin loaded")
+
         if plugins_cfg.get("hand", {}).get("enabled", False):
             from device import HandPlugin
             self._plugins.append(HandPlugin(plugins_cfg["hand"], namespace, ros2))
