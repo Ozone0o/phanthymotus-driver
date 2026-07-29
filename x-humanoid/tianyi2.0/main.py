@@ -107,6 +107,17 @@ class TianyiDeviceBundle:
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
             print("[bundle] CameraPlugin loaded")
 
+        for config_name, class_name in (("imu", "ImuPlugin"), ("hand_state", "HandStatePlugin"),
+                                        ("camera_depth", "DepthCameraPlugin"),
+                                        ("camera_pointcloud", "PointCloudPlugin"), ("light", "LightPlugin")):
+            if plugins_cfg.get(config_name, {}).get("enabled", False):
+                from device import ImuPlugin, HandStatePlugin, DepthCameraPlugin, PointCloudPlugin, LightPlugin
+                plugin_class = {"ImuPlugin": ImuPlugin, "HandStatePlugin": HandStatePlugin,
+                                "DepthCameraPlugin": DepthCameraPlugin, "PointCloudPlugin": PointCloudPlugin,
+                                "LightPlugin": LightPlugin}[class_name]
+                self._plugins.append(plugin_class(plugins_cfg[config_name], namespace, ros2))
+                print(f"[bundle] {class_name} loaded")
+
         if plugins_cfg.get("asr", {}).get("enabled", False):
             from device import AsrPlugin
             self._plugins.append(AsrPlugin(plugins_cfg["asr"], namespace, ros2))
@@ -196,6 +207,7 @@ class TianyiDeviceBundle:
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
 _bundle: TianyiDeviceBundle | None = None
+_server_name = "tianyi2-device-bundle"
 
 
 def make_handler():
@@ -259,7 +271,7 @@ def make_handler():
                     ok({
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "tianyi2-device-bundle", "version": "1.0.0"},
+                        "serverInfo": {"name": _server_name, "version": "1.0.0"},
                     })
                 elif method == "tools/list":
                     ok({"tools": _bundle.get_all_tools()})
@@ -316,11 +328,12 @@ def _start_registration(mcp_port: int, name: str, category: str):
 
 
 def main():
-    global _bundle
+    global _bundle, _server_name
 
     cfg       = _load_config()
     namespace = _resolve_namespace(cfg)
     mcp_port  = int(cfg.get("mcp_port", 15707))
+    _server_name = cfg.get("mcp_server_name", "tianyi2-device-bundle")
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
 
