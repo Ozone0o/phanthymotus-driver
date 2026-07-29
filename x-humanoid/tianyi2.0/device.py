@@ -575,6 +575,11 @@ class ImuPlugin(_JsonSensor):
         self._running = False
         self._topic = f"/{namespace}/state/imu"
         self._last_pub = 0.0
+        self._latest = {
+            "available": False,
+            "timestamp_ms": int(time.time() * 1000),
+            "source": None,
+        }
         self._subscriptions = []  # Keep rclpy subscriptions alive for the plugin lifetime.
         self._sub_node = Node("tianyi2_imu_sub", context=ros2.ctx_tianyi)
         self._pub_node = Node("tianyi2_imu_pub", context=ros2.ctx_core)
@@ -583,7 +588,9 @@ class ImuPlugin(_JsonSensor):
         self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
 
     def get_tool(self):
-        return self._tool("imu", "天轶2.0 IMU — 姿态、欧拉角、角速度、线加速度与错误码")
+        tool = self._tool("imu", "天轶2.0 IMU — 姿态、欧拉角、角速度、线加速度与错误码")
+        tool["multiInstance"] = False
+        return tool
 
     def start(self):
         """Subscribe to both IMU interfaces used by Tianyi deployments.
@@ -608,21 +615,25 @@ class ImuPlugin(_JsonSensor):
     def stop(self):
         self._running = False
 
-    def _publish(self, orientation, angular_velocity, linear_acceleration, euler, error=0):
+    def _publish(self, orientation, angular_velocity, linear_acceleration, euler, error=0, source=None):
         # The dashboard only needs the latest state.  Bound forwarding to 30 Hz
         # so a high-rate IMU cannot congest the domain-42 bridge.
         now = time.monotonic()
         if not self._running or now - self._last_pub < 1.0 / 30.0:
             return
         self._last_pub = now
-        out = String()
-        out.data = json.dumps({
+        self._latest = {
+            "available": True,
+            "timestamp_ms": int(time.time() * 1000),
+            "source": source,
             "orientation": orientation,
             "euler": euler,
             "angular_velocity": angular_velocity,
             "linear_acceleration": linear_acceleration,
             "error": error,
-        })
+        }
+        out = String()
+        out.data = json.dumps(self._latest)
         self._pub.publish(out)
 
     def _on_vendor_imu(self, msg):
@@ -632,6 +643,7 @@ class ImuPlugin(_JsonSensor):
             {"x": msg.linear_acceleration.x, "y": msg.linear_acceleration.y, "z": msg.linear_acceleration.z},
             {"roll": msg.euler.roll, "pitch": msg.euler.pitch, "yaw": msg.euler.yaw},
             msg.error,
+            source="/imu/status",
         )
 
     def _on_ros_imu(self, msg):
@@ -650,7 +662,17 @@ class ImuPlugin(_JsonSensor):
             {"roll": math.atan2(sinr_cosp, cosr_cosp),
              "pitch": math.asin(max(-1.0, min(1.0, sinp))),
              "yaw": math.atan2(siny_cosp, cosy_cosp)},
+            source="/imu/data",
         )
+
+    def dispatch(self, action, args):
+        if action in ("info", "read", "get", "imu"):
+            return {
+                "state": "running" if self._running else "idle",
+                "data": self._latest,
+                "topic_out": [{"topic": self._topic, "format": self._format}],
+            }
+        return {"state": "running" if self._running else "idle"}
 
 
 class HandStatePlugin(_JsonSensor):
