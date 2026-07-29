@@ -1285,7 +1285,12 @@ class ArmPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class WaistPlugin:
-    """腰部2DOF — set_pos / set_zero (不支持 KP/KD)"""
+    """腰部2DOF — move_pos / set_vel / set_zero (不支持 KP/KD)
+
+    兼容两种调用格式:
+      - 简化: {"action": "move_pos", "yaw": 30, "pitch": 10, "speed": 0.5, "current": 10.0}
+      - 标零: {"action": "set_zero", "joint_id": 31} 或 {"action": "set_zero", "joint_ids": [31, 32]}
+    """
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
@@ -1293,40 +1298,50 @@ class WaistPlugin:
         self._pub_node = Node("tianyi2_waist_cmd", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._pub_node)
         self._pub_pos = None
+        self._pub_vel = None
         self._pub_zero = None
 
     def get_tool(self) -> dict:
         return {
             "name": "waist",
             "type": "actuator",
-            "description": "天轶2.0 腰部控制 — 2DOF (yaw: -160°~180°, pitch: -45°~120°), 仅位置+标零",
+            "description": "天轶2.0 腰部控制 — 2DOF (yaw: -160°~180°, pitch: -45°~120°), 位置/速度/标零",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move_pos", "set_zero"],
+                    "action": {"type": "string", "enum": ["move_pos", "set_vel", "set_zero"],
                                "description": "控制模式"},
-                    "yaw": {"type": "number", "description": "偏航角(度), 左正右负, 范围[-160, 180]"},
-                    "pitch": {"type": "number", "description": "俯仰角(度), 前正后负, 范围[-45, 120]"},
-                    "joint_id": {"type": "integer", "enum": [31],
-                                 "description": "标零关节ID (31=waist_yaw)"},
+                    "yaw": {"type": "number", "description": "偏航角(度), 范围[-160, 180]"},
+                    "pitch": {"type": "number", "description": "俯仰角(度), 范围[-45, 120]"},
+                    "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
+                    "current": {"type": "number", "description": "最大电流(A), 默认10.0"},
+                    "joints": {"type": "array", "items": {"type": "object"},
+                               "description": "set_vel 关节命令: [{name:31|32, spd_rad_s, cur_a?}]"},
+                    "joint_id": {"type": "integer", "enum": [31, 32],
+                                 "description": "标零单个关节ID (31=waist_yaw, 32=waist_pitch)"},
+                    "joint_ids": {"type": "array", "items": {"type": "integer"},
+                                  "description": "标零多个关节ID, e.g. [31, 32]"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move_pos": {"params": ["yaw", "pitch"],
-                                 "description": "移动腰部到指定角度(度), 不传默认0"},
-                    "set_zero": {"params": ["joint_id"],
-                                 "description": "关节标零"},
+                    "move_pos": {"params": ["yaw", "pitch", "speed", "current"],
+                                 "description": "位置模式: 移动腰部到指定角度(度)"},
+                    "set_vel":  {"params": ["joints"],
+                                 "description": "速度模式: joints=[{name, spd_rad_s, cur_a?}]"},
+                    "set_zero": {"params": ["joint_id", "joint_ids"],
+                                 "description": "标零: 支持单个 joint_id 或数组 joint_ids"},
                 },
             },
         }
 
     def start(self):
         try:
-            from bodyctrl_msgs.msg import CmdSetMotorPosition
+            from bodyctrl_msgs.msg import CmdSetMotorPosition, CmdSetMotorSpeed
             from std_msgs.msg import String as StdString
             self._pub_pos  = self._pub_node.create_publisher(CmdSetMotorPosition, "/waist/cmd_pos", _RELIABLE_QOS)
+            self._pub_vel  = self._pub_node.create_publisher(CmdSetMotorSpeed, "/waist/cmd_vel", _RELIABLE_QOS)
             self._pub_zero = self._pub_node.create_publisher(StdString, "/waist/cmd_set_zero", _RELIABLE_QOS)
-            print("[WaistPlugin] publishers created")
+            print("[WaistPlugin] publishers created (/waist/cmd_pos, /waist/cmd_vel, /waist/cmd_set_zero)")
         except ImportError as e:
             print(f"[WaistPlugin] WARNING: {e}")
 
@@ -1335,16 +1350,28 @@ class WaistPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "move_pos":
-            return self._send_pos(args.get("yaw", 0), args.get("pitch", 0))
+            return self._send_pos(
+                args.get("yaw", 0), args.get("pitch", 0),
+                args.get("speed", 0.5), args.get("current", 10.0))
+        if action == "set_vel":
+            return self._send_vel(args.get("joints", []))
         if action == "set_zero":
-            return self._send_zero(args.get("joint_id", 31))
+            # 兼容 joint_id (单值) 和 joint_ids (数组)
+            jid = args.get("joint_id", None)
+            jids = args.get("joint_ids", None)
+            if jids is not None:
+                return self._send_zero(jids)
+            elif jid is not None:
+                return self._send_zero([jid])
+            else:
+                return self._send_zero([31, 32])  # 默认标零两个关节
         if action in ("start", "info"):
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
         return {"ok": False, "code": "INVALID_ARGUMENT", "message": f"unknown action: {action}"}
 
-    def _send_pos(self, yaw_deg: float, pitch_deg: float) -> dict:
+    def _send_pos(self, yaw_deg: float, pitch_deg: float, speed_rad_s: float = 0.5, current_a: float = 10.0) -> dict:
         if not self._pub_pos:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
         try:
@@ -1353,35 +1380,66 @@ class WaistPlugin:
             results = []
             for mid, deg in [(31, yaw_deg), (32, pitch_deg)]:
                 lim = _JOINT_LIMITS[mid]
-                pos, clamped = _clamp(deg, lim[0], lim[1])
-                spd_rpm, _ = _clamp(30.0, 0, lim[2])
-                cur, _ = _clamp(5.0, 0, lim[3])
+                pos_deg, clamped = _clamp(deg, lim[0], lim[1])
+                # spd 使用 rad/s (修复: 之前错误地把 RPM 当 rad/s 传入)
+                max_spd_rads = _rpm2rads(lim[2])
+                spd, _ = _clamp(speed_rad_s, 0, max_spd_rads)
+                cur, _ = _clamp(current_a, 0, lim[3])
                 cmd = SetMotorPosition()
                 cmd.name = mid
-                cmd.pos = _deg2rad(pos)
-                cmd.spd = spd_rpm
+                cmd.pos = _deg2rad(pos_deg)
+                cmd.spd = spd
                 cmd.cur = cur
                 msg.cmds.append(cmd)
-                results.append({"name": _ALL_JOINTS[mid], "pos": pos})
+                results.append({"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd, "cur_a": cur})
                 if clamped:
                     return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
-                            "message": f"waist joint {mid} ({_ALL_JOINTS[mid]}) pos out of range [{lim[0]}°, {lim[1]}°]"}
+                            "message": f"waist joint {mid} ({_ALL_JOINTS[mid]}) pos_deg out of range [{lim[0]}°, {lim[1]}°]"}
             self._pub_pos.publish(msg)
             return {"ok": True, "card": "waist", "action": "move_pos", "applied": results}
         except Exception as e:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
 
-    def _send_zero(self, joint_id: int) -> dict:
+    def _send_vel(self, joints: list) -> dict:
+        """速度模式: 发布到 /waist/cmd_vel"""
+        if not self._pub_vel:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorSpeed, SetMotorSpeed
+            msg = CmdSetMotorSpeed()
+            for j in joints:
+                mid = j.get("name")
+                if isinstance(mid, str):
+                    mid = 31 if "yaw" in mid.lower() else (32 if "pitch" in mid.lower() else int(mid))
+                if mid not in [31, 32]:
+                    return {"ok": False, "code": "INVALID_ARGUMENT",
+                            "message": f"unknown waist joint: {j.get('name')} (valid: 31/waist_yaw, 32/waist_pitch)"}
+                lim = _JOINT_LIMITS[mid]
+                max_spd = _rpm2rads(lim[2])
+                spd, _ = _clamp(j.get("spd_rad_s", 0), -max_spd, max_spd)
+                cur, _ = _clamp(j.get("cur_a", 10.0), 0, lim[3])
+                cmd = SetMotorSpeed(); cmd.name = mid; cmd.spd = spd; cmd.cur = cur
+                msg.cmds.append(cmd)
+            self._pub_vel.publish(msg)
+            return {"ok": True, "card": "waist", "action": "set_vel",
+                    "applied": [{"name": _ALL_JOINTS.get(c.name, str(c.name)),
+                                  "spd_rad_s": c.spd} for c in msg.cmds]}
+        except Exception as e:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
+
+    def _send_zero(self, joint_ids: list) -> dict:
         if not self._pub_zero:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
-        if joint_id not in [31]:
+        # 修复: 支持关节 31 和 32（之前只支持31）
+        valid = [jid for jid in joint_ids if jid in [31, 32]]
+        if not valid:
             return {"ok": False, "code": "INVALID_ARGUMENT",
-                    "message": f"No valid waist joint ID (valid: [31]), got: {joint_id}"}
+                    "message": f"No valid waist joint IDs (valid: [31, 32]), got: {joint_ids}"}
         from std_msgs.msg import String as StdString
-        msg = StdString(); msg.data = str(joint_id)
+        msg = StdString(); msg.data = ",".join(str(j) for j in valid)
         self._pub_zero.publish(msg)
         return {"ok": True, "card": "waist", "action": "set_zero",
-                "applied": [{"id": joint_id, "name": _ALL_JOINTS[joint_id]}]}
+                "applied": [{"id": j, "name": _ALL_JOINTS[j]} for j in valid]}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
