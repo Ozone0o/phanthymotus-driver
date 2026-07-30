@@ -1896,17 +1896,29 @@ class LegPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HandPlugin:
-    """Inspire灵巧手控制 — 6指位置/力/速度控制"""
+    """Inspire 灵巧手常用手势控制。
+
+    该卡片刻意不暴露逐指角度，避免在画布中误操作灵巧手。所有手势都
+    复用经过固定标定的六指位置，由底层仍通过 Inspire 的 JointState
+    控制话题下发。
+    """
 
     # 手指ID: 1=小指, 2=无名指, 3=中指, 4=食指, 5=拇指弯曲, 6=拇指旋转
     _FINGER_NAMES = ["little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
 
-    _GRASP_PRESETS = {
-        "power": [100, 100, 100, 100, 100, 50],
-        "pinch": [0, 0, 0, 80, 80, 60],
-        "lateral": [100, 100, 100, 100, 0, 80],
-        "tripod": [0, 0, 80, 80, 80, 50],
-        "point": [0, 0, 0, 0, 100, 50],
+    # 0 表示张开，100 表示弯曲到握紧。顺序见 _FINGER_NAMES。
+    _GESTURE_PRESETS = {
+        "thumbs_up": [100, 100, 100, 100, 0, 50],
+        "fist": [100, 100, 100, 100, 100, 50],
+        "victory": [100, 100, 0, 0, 70, 50],
+        "open_palm": [0, 0, 0, 0, 0, 0],
+    }
+
+    _GESTURE_LABELS = {
+        "thumbs_up": "点赞",
+        "fist": "握拳",
+        "victory": "比耶",
+        "open_palm": "张开手掌",
     }
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
@@ -1921,31 +1933,21 @@ class HandPlugin:
         return {
             "name": "hand",
             "type": "actuator",
-            "description": "天轶2.0 Inspire灵巧手 — 每手6指, 位置控制(0-100%: 0=张开, 100=握紧)",
+            "description": "天轶2.0 Inspire 灵巧手常用手势 — 点赞、握拳、比耶、张开手掌",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["set_angle", "open", "close", "grasp"],
-                               "description": "控制动作"},
+                               "enum": list(self._GESTURE_PRESETS),
+                               "description": "要执行的常用手势"},
                     "side": {"type": "string", "enum": ["left", "right", "both"],
                              "description": "控制哪只手"},
-                    "angles": {"type": "array", "items": {"type": "number"},
-                               "description": "6个手指位置(0-100%): [小指, 无名指, 中指, 食指, 拇指弯曲, 拇指旋转]"},
-                    "grasp_type": {"type": "string",
-                                   "enum": ["power", "pinch", "lateral", "tripod", "point"],
-                                   "description": "预设抓取模式"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "set_angle": {"params": ["side", "angles"],
-                                  "description": "设置手指角度(6个值, 0-100%)"},
-                    "open": {"params": ["side"],
-                             "description": "完全张开手"},
-                    "close": {"params": ["side"],
-                              "description": "完全握紧手"},
-                    "grasp": {"params": ["side", "grasp_type"],
-                              "description": "执行预设抓取动作"},
+                    gesture: {"params": ["side"],
+                              "description": label}
+                    for gesture, label in self._GESTURE_LABELS.items()
                 },
             },
         }
@@ -1966,19 +1968,14 @@ class HandPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         side = args.get("side", "both")
-        if action == "set_angle":
-            angles = args.get("angles", [])
-            if len(angles) != 6:
-                return {"error": "angles must have exactly 6 values (0-100%)"}
-            return self._send_angles(side, angles)
-        elif action == "open":
-            return self._send_angles(side, [0, 0, 0, 0, 0, 0])
-        elif action == "close":
-            return self._send_angles(side, [100, 100, 100, 100, 100, 50])
-        elif action == "grasp":
-            grasp_type = args.get("grasp_type", "power")
-            angles = self._GRASP_PRESETS.get(grasp_type, self._GRASP_PRESETS["power"])
-            return self._send_angles(side, angles)
+        if action in self._GESTURE_PRESETS:
+            if side not in ("left", "right", "both"):
+                return {"error": "side must be left, right, or both"}
+            result = self._send_angles(side, self._GESTURE_PRESETS[action])
+            if "error" not in result:
+                result["gesture"] = action
+                result["gesture_label"] = self._GESTURE_LABELS[action]
+            return result
         elif action in ("start", "info"):
             return {"state": "ready"}
         elif action == "stop":
