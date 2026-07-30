@@ -162,6 +162,11 @@ class TianyiDeviceBundle:
             self._plugins.append(TtsPlugin(plugins_cfg["tts"], namespace, ros2))
             print("[bundle] TtsPlugin loaded")
 
+        if plugins_cfg.get("audio", {}).get("enabled", False):
+            from device import AudioPlugin
+            self._plugins.append(AudioPlugin(plugins_cfg["audio"], namespace, ros2))
+            print("[bundle] AudioPlugin loaded")
+
         if plugins_cfg.get("nav", {}).get("enabled", False):
             from device import NavPlugin
             self._plugins.append(NavPlugin(plugins_cfg["nav"], namespace, ros2, slamtec_client))
@@ -171,6 +176,11 @@ class TianyiDeviceBundle:
             from device import ChatPlugin
             self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
             print("[bundle] ChatPlugin loaded")
+
+        if plugins_cfg.get("dialogue", {}).get("enabled", False):
+            from device import DialoguePlugin
+            self._plugins.append(DialoguePlugin(plugins_cfg["dialogue"], namespace, ros2))
+            print("[bundle] DialoguePlugin loaded")
 
         if plugins_cfg.get("lyre_event", {}).get("enabled", False):
             from device import LyreEventPlugin

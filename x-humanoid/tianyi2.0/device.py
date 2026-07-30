@@ -2043,6 +2043,214 @@ class TtsPlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# AudioPlugin (actuator) — 音频播放 (lyre PlayBinary/PlayText/PlayFile/PlayUrl)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AudioPlugin:
+    """音频播放 — 覆盖文档 5.9.6 全部音频播放接口 (PlayText/PlayFile/PlayUrl/PlayBinary + 控制)"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._srv_node = Node("tianyi2_audio", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._srv_node)
+
+        # Service clients — lazy init in start()
+        self._text_client = None   # PlayText
+        self._file_client = None   # PlayFile
+        self._url_client = None    # PlayUrl
+        self._binary_client = None # PlayBinary
+        self._stop_client = None   # PlayStop
+        self._pause_client = None  # PlayPause
+        self._resume_client = None # PlayResume
+
+        # Timeout for sync service calls (seconds)
+        self._call_timeout = plugin_config.get("call_timeout", 5.0)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "audio",
+            "type": "actuator",
+            "description": "天轶2.0 音频播放 — PlayText/PlayFile/PlayUrl/PlayBinary + 停止/暂停/恢复 (文档 5.9.6)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string",
+                               "enum": ["play_text", "play_file", "play_url", "play_binary",
+                                        "stop", "pause", "resume"],
+                               "description": "控制动作"},
+                    "text": {"type": "string",
+                             "description": "要合成播放的文本 (play_text)"},
+                    "path": {"type": "string",
+                             "description": "本地音频文件绝对路径 (play_file)"},
+                    "url": {"type": "string",
+                             "description": "远程音频文件 URL (play_url)"},
+                    "data_b64": {"type": "string",
+                                 "description": "Base64 编码的二进制音频数据 (play_binary)"},
+                    "force": {"type": "boolean",
+                              "description": "是否强制播放 (打断当前播放任务)", "default": False},
+                    "sid": {"type": "string",
+                            "description": "流标识符, 留空则自动生成"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "play_text":   {"params": ["text", "force", "sid"],
+                                    "description": "合成文本并播放 (TTS → 音频输出)"},
+                    "play_file":   {"params": ["path", "force", "sid"],
+                                    "description": "播放本地文件系统中的音频文件"},
+                    "play_url":    {"params": ["url", "force", "sid"],
+                                    "description": "播放远程 URL 指向的音频文件"},
+                    "play_binary": {"params": ["data_b64", "force", "sid"],
+                                    "description": "播放二进制音频数据 (Base64)"},
+                    "stop":   {"params": [], "description": "停止当前播放 (不可恢复)"},
+                    "pause":  {"params": [], "description": "暂停当前播放 (可恢复)"},
+                    "resume": {"params": [], "description": "恢复已暂停的播放"},
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from lyre_msgs.srv import (PlayText, PlayFile, PlayUrl, PlayBinary,
+                                        PlayStop, PlayPause, PlayResume)
+            self._text_client   = self._srv_node.create_client(PlayText,   "/audio_play/play_text")
+            self._file_client   = self._srv_node.create_client(PlayFile,   "/audio_play/play_file")
+            self._url_client    = self._srv_node.create_client(PlayUrl,    "/audio_play/play_url")
+            self._binary_client = self._srv_node.create_client(PlayBinary, "/audio_play/play_binary")
+            self._stop_client   = self._srv_node.create_client(PlayStop,   "/audio_play/stop")
+            self._pause_client  = self._srv_node.create_client(PlayPause,  "/audio_play/pause")
+            self._resume_client = self._srv_node.create_client(PlayResume, "/audio_play/resume")
+            print("[AudioPlugin] 7 service clients created (text/file/url/binary + stop/pause/resume)")
+        except ImportError as e:
+            print(f"[AudioPlugin] WARNING: msg import failed ({e})")
+
+    def stop(self):
+        pass
+
+    # ── dispatch ────────────────────────────────────────────────────────────
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "play_text":
+            text = args.get("text", "")
+            if not text:
+                return {"ok": False, "code": "INVALID_ARGUMENT", "message": "text is required"}
+            return self._call_play(self._text_client, "PlayText",
+                                   text=text, force=args.get("force", False),
+                                   sid=args.get("sid", ""))
+
+        elif action == "play_file":
+            path = args.get("path", "")
+            if not path:
+                return {"ok": False, "code": "INVALID_ARGUMENT", "message": "path is required"}
+            return self._call_play(self._file_client, "PlayFile",
+                                   path=path, force=args.get("force", False),
+                                   sid=args.get("sid", ""))
+
+        elif action == "play_url":
+            url = args.get("url", "")
+            if not url:
+                return {"ok": False, "code": "INVALID_ARGUMENT", "message": "url is required"}
+            return self._call_play(self._url_client, "PlayUrl",
+                                   url=url, force=args.get("force", False),
+                                   sid=args.get("sid", ""))
+
+        elif action == "play_binary":
+            data_b64 = args.get("data_b64", "")
+            if not data_b64:
+                return {"ok": False, "code": "INVALID_ARGUMENT", "message": "data_b64 is required"}
+            import base64
+            try:
+                raw = base64.b64decode(data_b64)
+            except Exception:
+                return {"ok": False, "code": "INVALID_ARGUMENT",
+                        "message": "data_b64 is not valid base64"}
+            # PlayBinary data field is uint8[]; ROS 2 Python expects list[int]
+            data_list = list(raw)
+            return self._call_play(self._binary_client, "PlayBinary",
+                                   data=data_list, force=args.get("force", False),
+                                   sid=args.get("sid", ""))
+
+        elif action == "stop":
+            return self._call_empty(self._stop_client, "stop")
+
+        elif action == "pause":
+            return self._call_empty(self._pause_client, "pause")
+
+        elif action == "resume":
+            return self._call_empty(self._resume_client, "resume")
+
+        elif action in ("start", "info"):
+            return {"state": "ready", "card": "audio"}
+
+        return {"ok": False, "code": "INVALID_ARGUMENT",
+                "message": f"unknown action: {action}"}
+
+    # ── helpers ─────────────────────────────────────────────────────────────
+
+    def _call_play(self, client, svc_name: str, **kwargs) -> dict:
+        """Send a play request synchronously and return the service response."""
+        if not client:
+            return {"ok": False, "code": "COMMUNICATION_ERROR",
+                    "message": f"{svc_name} service client not initialized"}
+
+        # Wait for service to become available
+        if not client.wait_for_service(timeout_sec=self._call_timeout):
+            return {"ok": False, "code": "COMMUNICATION_ERROR",
+                    "message": f"{svc_name} service not available (timeout {self._call_timeout}s)"}
+
+        try:
+            req = client.srv_type.Request()
+
+            # Common fields
+            sid   = kwargs.pop("sid", "")
+            force = kwargs.pop("force", False)
+            req.sid   = sid
+            req.seq   = 0
+            req.last  = True
+            req.force = force
+
+            # Payload field — the remaining kwarg
+            for key, val in kwargs.items():
+                setattr(req, key, val)
+
+            future = client.call_async(req)
+            rclpy.spin_until_future_complete(self._srv_node, future, timeout_sec=self._call_timeout)
+
+            if not future.done():
+                return {"ok": False, "code": "TIMEOUT",
+                        "message": f"{svc_name} call timed out ({self._call_timeout}s)"}
+
+            resp = future.result()
+            return {
+                "ok": True,
+                "card": "audio",
+                "action": svc_name,
+                "sid": resp.sid,
+                "code": resp.code,
+                "message": resp.message,
+            }
+        except Exception as e:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
+
+    def _call_empty(self, client, action_name: str) -> dict:
+        """Call a no-request / no-response service (stop/pause/resume)."""
+        if not client:
+            return {"ok": False, "code": "COMMUNICATION_ERROR",
+                    "message": f"{action_name} service client not initialized"}
+
+        if not client.wait_for_service(timeout_sec=self._call_timeout):
+            return {"ok": False, "code": "COMMUNICATION_ERROR",
+                    "message": f"{action_name} service not available"}
+
+        try:
+            req = client.srv_type.Request()
+            client.call_async(req)
+            return {"ok": True, "card": "audio", "action": action_name}
+        except Exception as e:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # NavPlugin (actuator)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2216,6 +2424,209 @@ class ChatPlugin:
         elif action == "stop":
             return {"state": "idle"}
         return {"error": f"unknown action: {action}"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DialoguePlugin (actuator) — 语音对话 (文档 5.9.8: 交互开关 + LlmAsk)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DialoguePlugin:
+    """语音对话 — 覆盖文档 5.9.8 语音对话接口 (交互开关 + LLM 提问)"""
+
+    _LLM_EVENT_NAMES = {0: "started", 1: "completed", 2: "stopped", 3: "cancelled", 4: "failed"}
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._running = False
+
+        # Service node (domain 0) — LlmAsk
+        self._srv_node = Node("tianyi2_dialogue_srv", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._srv_node)
+        self._ask_client = None
+
+        # Pub node (domain 0) — chat enable/disable
+        self._pub_node = Node("tianyi2_dialogue_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._chat_pub = None
+
+        # Sub/Pub nodes — for LLM result and event streaming (domain 0 → domain 42)
+        self._sub_node = Node("tianyi2_dialogue_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+        self._bridge_node = Node("tianyi2_dialogue_bridge", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._bridge_node)
+
+        # Output topic (domain 42) — 合并 rst + event 到单 topic
+        self._topic_stream = f"/{namespace}/dialogue/stream"
+        self._pub_stream = None
+
+        # Timeout for sync service calls (seconds)
+        self._call_timeout = plugin_config.get("call_timeout", 5.0)
+
+    def get_tools(self) -> list:
+        return [
+            {"name": "dialogue", "type": "actuator",
+             "description": "天轶2.0 语音对话 — 交互开关 + LLM 提问 (文档 5.9.8)",
+             "inputSchema": {
+                 "type": "object",
+                 "properties": {
+                     "action": {"type": "string",
+                                "enum": ["enable", "disable", "ask"],
+                                "description": "控制动作"},
+                     "text": {"type": "string",
+                              "description": "向 LLM 发送的问题文本 (ask)"},
+                     "id": {"type": "string",
+                            "description": "可选标识符，关联 ASR 识别 ID (ask)"},
+                 },
+                 "required": ["action"],
+                 "x-action-params": {
+                     "enable":  {"params": [], "description": "开启语音对话交互"},
+                     "disable": {"params": [], "description": "关闭语音对话交互"},
+                     "ask":     {"params": ["text", "id"],
+                                 "description": "向 LLM 大模型提问 (同步等待回复)"},
+                 },
+             }},
+            {"name": "dialogue_stream", "type": "sensor",
+             "description": "天轶2.0 LLM 对话反馈流 — 结果文本 + 生命周期事件 (文档 5.9.8)",
+             "inputSchema": {"type": "object", "properties": {}},
+             "topic_out": [{"topic": self._topic_stream, "format": "data/json"}]},
+        ]
+
+    def start(self):
+        self._running = True
+
+        # Actuator: chat enable/disable publisher (domain 0)
+        self._chat_pub = self._pub_node.create_publisher(Bool, "/audio_chat/enable", _RELIABLE_QOS)
+
+        # Sensor bridge (domain 0 → domain 42) — 单 topic 合并 rst + event
+        self._pub_stream = self._bridge_node.create_publisher(String, self._topic_stream, _RELIABLE_QOS)
+
+        try:
+            from lyre_msgs.srv import LlmAsk
+            from lyre_msgs.msg import LlmRst, LlmEvent
+
+            self._ask_client = self._srv_node.create_client(LlmAsk, "/audio_llm/ask")
+            self._sub_node.create_subscription(
+                LlmRst, "/audio_llm/rst", self._on_llm_rst, _RELIABLE_QOS)
+            self._sub_node.create_subscription(
+                LlmEvent, "/audio_llm/event", self._on_llm_event, _RELIABLE_QOS)
+            print("[DialoguePlugin] service client + chat pub + 2 subscriptions created")
+        except ImportError as e:
+            print(f"[DialoguePlugin] WARNING: lyre_msgs import failed ({e})")
+
+    def stop(self):
+        self._running = False
+
+    # ── dispatch ────────────────────────────────────────────────────────────
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        tool_name = args.get("_tool_name", "dialogue")
+
+        if tool_name == "dialogue":
+            if action == "enable":
+                if not self._chat_pub:
+                    return {"ok": False, "code": "COMMUNICATION_ERROR",
+                            "message": "chat publisher not initialized"}
+                msg = Bool()
+                msg.data = True
+                self._chat_pub.publish(msg)
+                return {"ok": True, "card": "dialogue", "action": "enable",
+                        "message": "语音对话已开启"}
+
+            elif action == "disable":
+                if not self._chat_pub:
+                    return {"ok": False, "code": "COMMUNICATION_ERROR",
+                            "message": "chat publisher not initialized"}
+                msg = Bool()
+                msg.data = False
+                self._chat_pub.publish(msg)
+                return {"ok": True, "card": "dialogue", "action": "disable",
+                        "message": "语音对话已关闭"}
+
+            elif action == "ask":
+                text = args.get("text", "")
+                qid = args.get("id", "")
+                if not text:
+                    return {"ok": False, "code": "INVALID_ARGUMENT",
+                            "message": "text is required"}
+                return self._ask_llm(text, qid)
+
+            elif action in ("start", "info"):
+                return {"state": "ready", "card": "dialogue"}
+            return {"ok": False, "code": "INVALID_ARGUMENT",
+                    "message": f"unknown action: {action}"}
+
+        elif tool_name == "dialogue_stream":
+            if action in ("start", "stop", "info"):
+                return {"state": "running" if self._running else "idle",
+                        "topic_out": [{"topic": self._topic_stream, "format": "data/json"}]}
+            return {"state": "running"}
+
+        return {"ok": False, "code": "INVALID_ARGUMENT",
+                "message": f"unknown tool: {tool_name}"}
+
+    # ── LLM ask with sync response ──────────────────────────────────────────
+
+    def _ask_llm(self, text: str, qid: str) -> dict:
+        """Send question to LLM and wait for the first response."""
+        if not self._ask_client:
+            return {"ok": False, "code": "COMMUNICATION_ERROR",
+                    "message": "LlmAsk service client not initialized"}
+
+        if not self._ask_client.wait_for_service(timeout_sec=self._call_timeout):
+            return {"ok": False, "code": "COMMUNICATION_ERROR",
+                    "message": f"LlmAsk service not available (timeout {self._call_timeout}s)"}
+
+        try:
+            from lyre_msgs.srv import LlmAsk
+            req = LlmAsk.Request()
+            req.text = text
+            req.id = qid
+
+            future = self._ask_client.call_async(req)
+            rclpy.spin_until_future_complete(self._srv_node, future, timeout_sec=self._call_timeout)
+
+            if not future.done():
+                return {"ok": False, "code": "TIMEOUT",
+                        "message": f"LlmAsk call timed out ({self._call_timeout}s)"}
+
+            resp = future.result()
+            return {
+                "ok": True,
+                "card": "dialogue",
+                "action": "ask",
+                "sid": resp.sid,
+                "code": resp.code,
+                "message": resp.message,
+                "text": text[:100],
+            }
+        except Exception as e:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
+
+    # ── LLM result / event callbacks ────────────────────────────────────────
+
+    def _on_llm_rst(self, msg):
+        if not self._running:
+            return
+        out = String()
+        out.data = json.dumps({
+            "type": "rst",
+            "sid": msg.sid, "seq": msg.seq, "last": msg.last, "text": msg.text,
+        })
+        self._pub_stream.publish(out)
+
+    def _on_llm_event(self, msg):
+        if not self._running:
+            return
+        out = String()
+        out.data = json.dumps({
+            "type": "event",
+            "sid": msg.sid, "seq": msg.seq,
+            "event": msg.event,
+            "event_name": self._LLM_EVENT_NAMES.get(msg.event, f"unknown_{msg.event}"),
+            "message": msg.message,
+        })
+        self._pub_stream.publish(out)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

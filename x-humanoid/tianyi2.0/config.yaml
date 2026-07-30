@@ -43,9 +43,13 @@ plugins:
     enabled: true
   tts:
     enabled: true
+  audio:
+    enabled: true
   nav:
     enabled: true
   chat:
+    enabled: true
+  dialogue:
     enabled: true
   lyre_event:
     enabled: true
