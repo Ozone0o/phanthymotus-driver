@@ -902,10 +902,14 @@ class DepthCameraPlugin:
 
 
 class PointCloudPlugin:
-    """Pack and gravity-level Orbbec optical-frame points for Agent Core."""
+    """Pack gravity-levelled, floor-referenced Orbbec points for Agent Core."""
     _format = "sensor/pointcloud"
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/points"; self._last = 0.0; self._intrinsics = None
+        # The renderer's horizontal grid is Y=0.  Gravity alignment fixes the
+        # orientation but leaves the camera as the origin; shift upward by the
+        # head camera's floor height so the physical floor is at Y=0.
+        self._floor_offset_m = max(-3.0, min(float(plugin_config.get("floor_offset_m", 1.50)), 3.0))
         self._gravity_world = None; self._gravity_lock = threading.Lock()
         self._sub_node = Node("tianyi2_points_sub", context=ros2.ctx_tianyi); self._pub_node = Node("tianyi2_points_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
@@ -944,8 +948,8 @@ class PointCloudPlugin:
         with self._gravity_lock: return self._gravity_world
 
     @staticmethod
-    def _to_renderer_frame(x, y, z, gravity=None):
-        """Map optical points to the renderer and align camera up with world up."""
+    def _to_renderer_frame(x, y, z, gravity=None, floor_offset_m=0.0):
+        """Map optical points to a gravity-levelled, floor-referenced renderer frame."""
         # Renderer map is (input_y, -input_z, -input_x), so this packed form
         # yields world (x, -y, -z): right, up, backward from optical raw XYZ.
         wx, wy, wz = x, -y, -z
@@ -966,6 +970,7 @@ class PointCloudPlugin:
                 wx += cross_x + factor * cross2_x
                 wy += cross_y + factor * cross2_y
                 wz += cross_z + factor * cross2_z
+        wy += floor_offset_m
         # Invert the renderer map above to pack the leveled world point.
         return -wz, wx, -wy
     def _on_cloud(self, msg):
@@ -979,7 +984,8 @@ class PointCloudPlugin:
             x = struct.unpack_from("<f", raw, base + fields["x"])[0]
             y = struct.unpack_from("<f", raw, base + fields["y"])[0]
             z = struct.unpack_from("<f", raw, base + fields["z"])[0]
-            packed.extend(struct.pack("<fff", *self._to_renderer_frame(x, y, z, gravity)))
+            packed.extend(struct.pack("<fff", *self._to_renderer_frame(
+                x, y, z, gravity, self._floor_offset_m)))
         from std_msgs.msg import UInt8MultiArray
         out = UInt8MultiArray(); out.data = list(packed); self._pub.publish(out)
     def _on_info(self, msg): self._intrinsics = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
@@ -996,7 +1002,8 @@ class PointCloudPlugin:
                 if d == 0: continue
                 z = d / 1000.0
                 x, y = (u - cx) * z / fx, (v - cy) * z / fy
-                packed.extend(struct.pack("<fff", *self._to_renderer_frame(x, y, z, gravity))); count += 1
+                packed.extend(struct.pack("<fff", *self._to_renderer_frame(
+                    x, y, z, gravity, self._floor_offset_m))); count += 1
         if not count: return
         from std_msgs.msg import UInt8MultiArray
         out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)

@@ -21,6 +21,10 @@ plugins:
     hz: 8
   camera_pointcloud:
     enabled: true
+    # Head camera height above the floor.  The point-cloud renderer uses Y=0
+    # as its grid plane, so raise the gravity-levelled cloud by this amount
+    # to place the physical floor on that plane.
+    floor_offset_m: 1.50
   asr:
     enabled: true
   nav_state:
