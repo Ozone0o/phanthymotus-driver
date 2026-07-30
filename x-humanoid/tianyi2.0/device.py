@@ -121,8 +121,8 @@ _JOINT_LIMITS = {
     31: (-160,   180,   30,  31.0),
     32: (-45,    120,   37.5, 82.0),
     # 左腿
-    51: (-13,    80,    37.5, 35.0),
-    52: (-26,    160,   37.5, 35.0),
+    51: (-40,    5,     37.5, 5.0),
+    52: (-23,    20,    37.5, 5.0),
 }
 
 
@@ -1547,16 +1547,16 @@ class LegPlugin:
         return {
             "name": "leg",
             "type": "actuator",
-            "description": "天轶2.0 腿部控制 — 2DOF (hip: -13°~80°, knee: -26°~160°), 位置控制/标零",
+            "description": "天轶2.0 腿部控制 — 2DOF (hip: -40°~5°, knee: -23°~20°), 位置控制/标零",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["move_pos", "set_zero"],
                                "description": "控制模式"},
-                    "hip": {"type": "number", "description": "髋关节俯仰角(度), 范围[-13, 80], 默认0"},
-                    "knee": {"type": "number", "description": "膝关节俯仰角(度), 范围[-26, 160], 默认0"},
+                    "hip": {"type": "number", "description": "髋关节俯仰角(度), 范围[-40, 5], 默认0"},
+                    "knee": {"type": "number", "description": "膝关节俯仰角(度), 范围[-23, 20], 默认0"},
                     "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
-                    "current": {"type": "number", "description": "最大电流(A), 默认10.0"},
+                    "current": {"type": "number", "description": "最大电流(A), 默认5.0"},
                 },
                 "required": ["action"],
                 "x-action-params": {
@@ -1583,7 +1583,7 @@ class LegPlugin:
         if action == "move_pos":
             return self._send_pos(
                 args.get("hip", 0), args.get("knee", 0),
-                args.get("speed", 0.5), args.get("current", 10.0))
+                args.get("speed", 0.5), args.get("current", 5.0))
         if action == "set_zero":
             return self._send_pos(0, 0)
         if action in ("start", "info"):
@@ -1592,7 +1592,7 @@ class LegPlugin:
             return {"state": "idle"}
         return {"ok": False, "code": "INVALID_ARGUMENT", "message": f"unknown action: {action}"}
 
-    def _send_pos(self, hip_deg: float, knee_deg: float, speed_rad_s: float = 0.5, current_a: float = 10.0) -> dict:
+    def _send_pos(self, hip_deg: float, knee_deg: float, speed_rad_s: float = 0.5, current_a: float = 5.0) -> dict:
         if not self._pub_pos:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
         try:
