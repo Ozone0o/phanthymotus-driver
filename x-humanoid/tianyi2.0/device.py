@@ -802,6 +802,9 @@ class DepthCameraPlugin:
                 "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
     def start(self):
         from sensor_msgs.msg import Image
+        import cv2
+        import numpy as np
+        self._cv2, self._np = cv2, np
         latest_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -845,17 +848,46 @@ class DepthCameraPlugin:
             self._latest_image = None
         if msg is None:
             return
-        # Rebuild the message for the independent domain-42 context.  This is
-        # a raw Z16 copy; it does not convert or re-encode the depth image.
+        # Agent Core's current depth renderer consumes a raw, headerless
+        # 640x480 Z16 payload.  The Orbbec provides 1280x720, so center-crop
+        # it to 4:3 and resize with nearest-neighbour interpolation.  This
+        # preserves depth values (unlike linear interpolation) and keeps the
+        # ROS Image metadata exactly aligned with the byte payload.
+        dashboard = self._to_dashboard_depth(msg)
+        if dashboard is None:
+            return
+
+        # Rebuild the message for the independent domain-42 context.
         from sensor_msgs.msg import Image
         out = Image()
         out.header = msg.header
-        out.height, out.width, out.encoding = msg.height, msg.width, msg.encoding
-        out.is_bigendian, out.step, out.data = msg.is_bigendian, msg.step, msg.data
+        out.height, out.width, out.encoding = 480, 640, "16UC1"
+        out.is_bigendian, out.step, out.data = 0, 1280, dashboard.tobytes()
         self._pub.publish(out)
         self._forwarded_frames += 1
-        if self._forwarded_frames % 30 == 1:
-            print(f"[DepthCameraPlugin] forwarded {self._forwarded_frames} latest Z16 frames")
+
+    def _to_dashboard_depth(self, msg):
+        """Return a 640x480 uint16 depth image, or None for malformed input."""
+        if msg.encoding not in ("16UC1", "mono16") or msg.is_bigendian:
+            return None
+        width, height, step = int(msg.width), int(msg.height), int(msg.step)
+        if width <= 0 or height <= 0 or step < width * 2:
+            return None
+        raw = self._np.frombuffer(msg.data, dtype=self._np.uint8)
+        needed = height * step
+        if raw.size < needed:
+            return None
+        # Respect source row stride before interpreting its pixels as uint16.
+        depth = raw[:needed].reshape(height, step)[:, :width * 2].view(self._np.uint16).reshape(height, width)
+        if width * 3 > height * 4:  # 16:9 → centered 4:3 crop
+            crop_width = height * 4 // 3
+            left = (width - crop_width) // 2
+            depth = depth[:, left:left + crop_width]
+        elif width * 3 < height * 4:  # portrait input → centered 4:3 crop
+            crop_height = width * 3 // 4
+            top = (height - crop_height) // 2
+            depth = depth[top:top + crop_height, :]
+        return self._cv2.resize(depth, (640, 480), interpolation=self._cv2.INTER_NEAREST)
     def dispatch(self, action, args):
         return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
 
@@ -1225,6 +1257,105 @@ class NavStatePlugin:
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Lidar2DPlugin (sensor)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Lidar2DPlugin:
+    """Slamtec 2D laser-scan card.
+
+    The chassis REST endpoint returns polar points as ``angle`` (radians),
+    ``distance`` (metres), and ``valid``.  Agent Core's lidar card consumes a
+    JSON String topic, therefore this plugin turns them into robot-frame x/y
+    metres before publishing into the Domain 42 data bus.
+    """
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
+        self._slamtec = slamtec_client
+        self._topic = f"/{namespace}/sensor/lidar_2d"
+        self._hz = max(1.0, min(float(plugin_config.get("hz", 10)), 15.0))
+        self._max_points = max(100, min(int(plugin_config.get("max_points", 1440)), 3000))
+        self._running = False
+        self._last_frame: dict = {"timestamp_ms": 0, "points": [], "point_count": 0}
+
+        self._pub_node = Node("tianyi2_lidar_2d_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "lidar_2d",
+            "type": "sensor",
+            "description": "思岚底盘二维激光雷达：实时极坐标扫描转换为底盘坐标系 x/y 点云",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "sensor/lidar-2d"}],
+        }
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True, name="tianyi-lidar-2d")
+        self._thread.start()
+        print(f"[Lidar2DPlugin] polling {self._topic} at {self._hz:g}Hz")
+
+    def stop(self):
+        self._running = False
+
+    def _to_frame(self, scan: dict) -> dict:
+        raw_points = scan.get("laser_points", []) if isinstance(scan, dict) else []
+        valid_points = []
+        for point in raw_points:
+            if not isinstance(point, dict) or not point.get("valid", False):
+                continue
+            try:
+                angle = float(point["angle"])
+                distance = float(point["distance"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not (math.isfinite(angle) and math.isfinite(distance) and distance > 0.0):
+                continue
+            valid_points.append({"x": round(distance * math.cos(angle), 4),
+                                 "y": round(distance * math.sin(angle), 4)})
+
+        # Preserve the complete angular field-of-view while bounding payload and UI work.
+        if len(valid_points) > self._max_points:
+            stride = math.ceil(len(valid_points) / self._max_points)
+            valid_points = valid_points[::stride]
+
+        return {
+            "timestamp_ms": int(time.time() * 1000),
+            "frame_id": "laser",
+            "source": "slamtec_rest:/api/core/system/v1/laserscan",
+            "points": valid_points,
+            "point_count": len(valid_points),
+            "raw_point_count": len(raw_points),
+        }
+
+    def _poll_loop(self):
+        interval = 1.0 / self._hz
+        while self._running:
+            started = time.monotonic()
+            try:
+                frame = self._to_frame(self._slamtec.get_laser_scan())
+                self._last_frame = frame
+                msg = String()
+                msg.data = json.dumps(frame, separators=(",", ":"))
+                self._pub.publish(msg)
+            except Exception as e:
+                print(f"[Lidar2DPlugin] scan read failed: {e}")
+            time.sleep(max(0.0, interval - (time.monotonic() - started)))
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "stop", "info", "read", "get", "lidar_2d"):
+            return {
+                "state": "running" if self._running else "idle",
+                "data": self._last_frame,
+                "topic_out": [{"topic": self._topic, "format": "sensor/lidar-2d"}],
+            }
         return {"state": "running"}
 
 
