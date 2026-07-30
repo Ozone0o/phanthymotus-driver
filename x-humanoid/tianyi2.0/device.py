@@ -1035,12 +1035,24 @@ class LightPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AsrPlugin:
-    """语音识别结果 (lyre ASR)"""
+    """语音识别接口 (lyre ASR) — 覆盖文档 5.9.7: 唤醒词 + 语音识别结果 + ASR事件"""
+
+    # ASR 事件名映射 (文档 5.9.7 AsrEvent 定义)
+    _ASR_EVENT_NAMES = {
+        2: "error",          # 出错，arg1=错误码
+        3: "state",          # 服务状态变更
+        4: "wakeup",         # 唤醒
+        5: "sleep",          # 休眠
+        6: "vad",            # VAD 检测
+        10: "pre_sleep",     # 准备休眠
+        13: "connected",     # 与服务端建立连接
+        14: "disconnected",  # 与服务端断开连接
+    }
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
-        self._topic = f"/{namespace}/asr/text"
+        self._topic = f"/{namespace}/asr"
         self._running = False
 
         self._sub_node = Node("tianyi2_asr_sub", context=ros2.ctx_tianyi)
@@ -1054,7 +1066,11 @@ class AsrPlugin:
         return {
             "name": "asr",
             "type": "sensor",
-            "description": "天轶2.0 语音识别 (lyre ASR) — 实时语音转文字",
+            "description": (
+                "天轶2.0 语音识别接口 (文档 5.9.7) — "
+                "唤醒词检测(AsrKeyword) + 语音识别结果(AsrIat) + ASR状态事件(AsrEvent) + "
+                "兼容已弃用的 /xunfei/aiui_msg"
+            ),
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
@@ -1062,30 +1078,92 @@ class AsrPlugin:
     def start(self):
         self._running = True
         try:
-            from lyre_msgs.msg import AsrIat
+            from lyre_msgs.msg import AsrIat, AsrKeyword, AsrEvent
+
+            # 1. 监听语音识别结果 — /audio_asr/iat (AsrIat: id + text)
             self._sub_node.create_subscription(
-                AsrIat, "/audio_asr/iat", self._on_asr, _RELIABLE_QOS)
-            print("[AsrPlugin] subscription created")
+                AsrIat, "/audio_asr/iat", self._on_iat, _RELIABLE_QOS)
+
+            # 2. 监听唤醒事件 — /audio_asr/keyword (AsrKeyword: keyword + angle)
+            self._sub_node.create_subscription(
+                AsrKeyword, "/audio_asr/keyword", self._on_keyword, _RELIABLE_QOS)
+
+            # 3. 监听其它事件 — /audio_asr/event (AsrEvent: event + arg1 + arg2)
+            self._sub_node.create_subscription(
+                AsrEvent, "/audio_asr/event", self._on_event, _RELIABLE_QOS)
+
+            # 4. 已弃用兼容 — /xunfei/aiui_msg (std_msgs/String)
+            self._sub_node.create_subscription(
+                String, "/xunfei/aiui_msg", self._on_aiui, _RELIABLE_QOS)
+
+            print("[AsrPlugin] 4 subscriptions: iat, keyword, event, aiui_msg (doc 5.9.7)")
         except ImportError:
-            # Fallback: subscribe as String
+            # Fallback: 仅订阅 IAT，使用 String 类型
             self._sub_node.create_subscription(
-                String, "/audio_asr/iat", self._on_asr_string, _RELIABLE_QOS)
-            print("[AsrPlugin] fallback to String subscription")
+                String, "/audio_asr/iat", self._on_iat_string, _RELIABLE_QOS)
+            print("[AsrPlugin] fallback: String subscription on /audio_asr/iat")
 
     def stop(self):
         self._running = False
 
-    def _on_asr(self, msg):
+    # ── 发布辅助 ────────────────────────────────────────────────────────────
+
+    def _publish(self, data: dict):
         if not self._running:
             return
         out = String()
-        out.data = json.dumps({"id": msg.id, "text": msg.text})
+        out.data = json.dumps(data)
         self._pub.publish(out)
 
-    def _on_asr_string(self, msg):
-        if not self._running:
-            return
-        self._pub.publish(msg)
+    # ── 回调: 语音识别结果 ───────────────────────────────────────────────────
+
+    def _on_iat(self, msg):
+        """/audio_asr/iat → AsrIat: 实时语音转文字结果"""
+        self._publish({
+            "type": "iat",
+            "id": msg.id,
+            "text": msg.text,
+        })
+
+    def _on_iat_string(self, msg):
+        """Fallback: String 类型的 IAT 消息"""
+        self._publish({
+            "type": "iat",
+            "text": msg.data,
+        })
+
+    # ── 回调: 唤醒词 ───────────────────────────────────────────────────────
+
+    def _on_keyword(self, msg):
+        """/audio_asr/keyword → AsrKeyword: 唤醒词 + 声源角度"""
+        self._publish({
+            "type": "keyword",
+            "keyword": msg.keyword,
+            "angle_deg": msg.angle,
+        })
+
+    # ── 回调: ASR 事件 ──────────────────────────────────────────────────────
+
+    def _on_event(self, msg):
+        """/audio_asr/event → AsrEvent: ASR 状态事件 (唤醒/休眠/错误/连接等)"""
+        self._publish({
+            "type": "event",
+            "event": msg.event,
+            "event_name": self._ASR_EVENT_NAMES.get(msg.event, f"unknown_{msg.event}"),
+            "arg1": msg.arg1,
+            "arg2": msg.arg2,
+        })
+
+    # ── 回调: 已弃用兼容 ─────────────────────────────────────────────────────
+
+    def _on_aiui(self, msg):
+        """/xunfei/aiui_msg → 已弃用，透传原始数据"""
+        self._publish({
+            "type": "aiui",
+            "raw": msg.data,
+        })
+
+    # ── dispatch ────────────────────────────────────────────────────────────
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "stop", "info"):
