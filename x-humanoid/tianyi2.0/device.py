@@ -1472,7 +1472,7 @@ class WaistPlugin:
     """腰部2DOF — move_pos / set_zero (不支持 KP/KD)
 
     调用格式:
-      - 位置控制: {"action": "move_pos", "yaw": 30, "pitch": 10, "speed": 0.5, "current": 10.0}
+      - 位置控制: {"action": "move_pos", "yaw": 30, "pitch": 10, "speed": 0.5}
       - 标零:   {"action": "set_zero"}  (等价于 move_pos yaw=0, pitch=0)
     """
 
@@ -1496,11 +1496,10 @@ class WaistPlugin:
                     "yaw": {"type": "number", "description": "偏航角(度), 范围[-160, 180], 默认0"},
                     "pitch": {"type": "number", "description": "俯仰角(度), 范围[-45, 120], 默认0"},
                     "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
-                    "current": {"type": "number", "description": "最大电流(A), 默认10.0"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move_pos": {"params": ["yaw", "pitch", "speed", "current"],
+                    "move_pos": {"params": ["yaw", "pitch", "speed"],
                                  "description": "位置模式: 移动腰部到指定角度(度)"},
                     "set_zero": {"params": [],
                                  "description": "标零: 等价于 move_pos yaw=0, pitch=0"},
@@ -1523,7 +1522,7 @@ class WaistPlugin:
         if action == "move_pos":
             return self._send_pos(
                 args.get("yaw", 0), args.get("pitch", 0),
-                args.get("speed", 0.5), args.get("current", 10.0))
+                args.get("speed", 0.5))
         if action == "set_zero":
             return self._send_pos(0, 0)
         if action in ("start", "info"):
@@ -1532,7 +1531,7 @@ class WaistPlugin:
             return {"state": "idle"}
         return {"ok": False, "code": "INVALID_ARGUMENT", "message": f"unknown action: {action}"}
 
-    def _send_pos(self, yaw_deg: float, pitch_deg: float, speed_rad_s: float = 0.5, current_a: float = 10.0) -> dict:
+    def _send_pos(self, yaw_deg: float, pitch_deg: float, speed_rad_s: float = 0.5) -> dict:
         if not self._pub_pos:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
         try:
@@ -1545,14 +1544,12 @@ class WaistPlugin:
                 # spd 使用 rad/s (修复: 之前错误地把 RPM 当 rad/s 传入)
                 max_spd_rads = _rpm2rads(lim[2])
                 spd, _ = _clamp(speed_rad_s, 0, max_spd_rads)
-                cur, _ = _clamp(current_a, 0, lim[3])
                 cmd = SetMotorPosition()
                 cmd.name = mid
                 cmd.pos = _deg2rad(pos_deg)
                 cmd.spd = spd
-                cmd.cur = cur
                 msg.cmds.append(cmd)
-                results.append({"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd, "cur_a": cur})
+                results.append({"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd})
                 if clamped:
                     return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
                             "message": f"waist joint {mid} ({_ALL_JOINTS[mid]}) pos_deg out of range [{lim[0]}°, {lim[1]}°]"}
