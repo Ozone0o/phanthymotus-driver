@@ -1711,7 +1711,8 @@ class WaistPlugin:
     """腰部偏航 + 腿部升降 (yaw + knee, 俯仰角已禁用)
 
     调用格式:
-      - 位置控制: {"action": "move_pos", "yaw": 30, "knee": 10, "speed": 0.5}
+      - 腰偏航: {"action": "move_yaw", "yaw": 30, "speed": 0.5}
+      - 膝升降: {"action": "move_knee", "knee": 10, "speed": 0.5}
       - 标零:   {"action": "set_zero"}  (yaw=0, knee=-20°)
     """
 
@@ -1727,11 +1728,11 @@ class WaistPlugin:
         return {
             "name": "waist",
             "type": "actuator",
-            "description": "天轶2.0 腰部+腿部控制 — yaw (-160°~180°) + knee (-23°~20°), 俯仰角已禁用",
+            "description": "天轶2.0 腰部偏航+腿部升降 — yaw (-160°~180°), knee (-23°~20°), 俯仰角已禁用",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move_pos", "set_zero"],
+                    "action": {"type": "string", "enum": ["move_yaw", "move_knee", "set_zero"],
                                "description": "控制模式"},
                     "yaw": {"type": "number", "description": "腰偏航角(度), 范围[-160, 180], 默认0"},
                     "knee": {"type": "number", "description": "膝关节俯仰角(度), 范围[-23, 20], 默认0"},
@@ -1739,8 +1740,10 @@ class WaistPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move_pos": {"params": ["yaw", "knee", "speed"],
-                                 "description": "位置模式: 控制腰部yaw和腿部knee角度(度)"},
+                    "move_yaw": {"params": ["yaw", "speed"],
+                                 "description": "腰部偏航: 控制yaw角度(度)"},
+                    "move_knee": {"params": ["knee", "speed"],
+                                  "description": "腿部升降: 控制knee角度(度)"},
                     "set_zero": {"params": [],
                                  "description": "标零: yaw=0, knee=-20°"},
                 },
@@ -1760,56 +1763,64 @@ class WaistPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action == "move_pos":
-            return self._send_pos(
-                args.get("yaw", 0), args.get("knee", 0),
-                args.get("speed", 0.5))
+        if action == "move_yaw":
+            return self._send_yaw(args.get("yaw", 0), args.get("speed", 0.5))
+        if action == "move_knee":
+            return self._send_knee(args.get("knee", 0), args.get("speed", 0.5))
         if action == "set_zero":
-            return self._send_pos(0, -20.0)
+            r1 = self._send_yaw(0)
+            r2 = self._send_knee(-20.0)
+            if not r1.get("ok") or not r2.get("ok"):
+                return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "set_zero failed"}
+            return {"ok": True, "card": "waist", "action": "set_zero",
+                    "applied": r1.get("applied", []) + r2.get("applied", [])}
         if action in ("start", "info"):
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
         return {"ok": False, "code": "INVALID_ARGUMENT", "message": f"unknown action: {action}"}
 
-    def _send_pos(self, yaw_deg: float, knee_deg: float, speed_rad_s: float = 0.5) -> dict:
-        if not self._pub_waist or not self._pub_leg:
+    def _send_yaw(self, yaw_deg: float, speed_rad_s: float = 0.5) -> dict:
+        if not self._pub_waist:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
-            applied = []
-
-            # yaw → /waist/cmd_pos
-            msg_w = CmdSetMotorPosition()
+            msg = CmdSetMotorPosition()
             mid = 31
             lim = _JOINT_LIMITS[mid]
             pos_deg, clamped = _clamp(yaw_deg, lim[0], lim[1])
             spd, _ = _clamp(speed_rad_s, 0, _rpm2rads(lim[2]))
             cmd = SetMotorPosition()
             cmd.name = mid; cmd.pos = _deg2rad(pos_deg); cmd.spd = spd; cmd.cur = 5.0
-            msg_w.cmds.append(cmd)
-            applied.append({"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd})
+            msg.cmds.append(cmd)
             if clamped:
                 return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
                         "message": f"waist yaw out of range [{lim[0]}°, {lim[1]}°]"}
-            self._pub_waist.publish(msg_w)
+            self._pub_waist.publish(msg)
+            return {"ok": True, "card": "waist", "action": "move_yaw",
+                    "applied": [{"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd}]}
+        except Exception as e:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
 
-            # knee → /leg/cmd_pos
-            msg_l = CmdSetMotorPosition()
+    def _send_knee(self, knee_deg: float, speed_rad_s: float = 0.5) -> dict:
+        if not self._pub_leg:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+            msg = CmdSetMotorPosition()
             mid = 52
             lim = _JOINT_LIMITS[mid]
             pos_deg, clamped = _clamp(knee_deg, lim[0], lim[1])
             spd, _ = _clamp(speed_rad_s, 0, _rpm2rads(lim[2]))
             cmd = SetMotorPosition()
             cmd.name = mid; cmd.pos = _deg2rad(pos_deg); cmd.spd = spd; cmd.cur = 5.0
-            msg_l.cmds.append(cmd)
-            applied.append({"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd})
+            msg.cmds.append(cmd)
             if clamped:
                 return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
                         "message": f"leg knee out of range [{lim[0]}°, {lim[1]}°]"}
-            self._pub_leg.publish(msg_l)
-
-            return {"ok": True, "card": "waist", "action": "move_pos", "applied": applied}
+            self._pub_leg.publish(msg)
+            return {"ok": True, "card": "waist", "action": "move_knee",
+                    "applied": [{"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd}]}
         except Exception as e:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
 
