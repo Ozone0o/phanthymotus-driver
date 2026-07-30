@@ -1769,13 +1769,13 @@ class LegPlugin:
             return {"state": "idle"}
         return {"ok": False, "code": "INVALID_ARGUMENT", "message": f"unknown action: {action}"}
 
-    # 高度→关节角度映射（实测四点线性插值）
-    # height 0 (归零):  hip=5°,  knee=-20°
-    # height 100 (最高): hip=-40°, knee=20°
+    # 高度→关节角度映射（hip固定，仅knee升降，避免前后俯仰）
+    # height 0 (最低):  hip=5°,  knee=-20°
+    # height 100 (最高): hip=5°,  knee=20°
     @staticmethod
     def _height_to_angles(height: float) -> tuple:
         h = max(0.0, min(100.0, height)) / 100.0  # clamp to [0,1]
-        hip_deg = 5.0 - 45.0 * h    # 5 → -40
+        hip_deg = 5.0                # 固定，防止前后俯仰
         knee_deg = -20.0 + 40.0 * h  # -20 → 20
         return hip_deg, knee_deg
 
