@@ -1724,7 +1724,6 @@ class LegPlugin:
                     "knee": {"type": "number", "description": "膝关节俯仰角(度), 范围[-23, 20], 默认0"},
                     "height": {"type": "number", "description": "腿高度(0-100), 0=归零最低, 100=最高"},
                     "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
-                    "current": {"type": "number", "description": "最大电流(A), 默认5.0"},
                 },
                 "required": ["action"],
                 "x-action-params": {
@@ -1732,7 +1731,7 @@ class LegPlugin:
                                  "description": "位置模式: 移动腿部到指定角度(度)"},
                     "set_zero": {"params": [],
                                  "description": "标零: 回到归零位姿 (hip=5°, knee=-20°)"},
-                    "set_height": {"params": ["height", "speed", "current"],
+                    "set_height": {"params": ["height", "speed"],
                                    "description": "高度模式: 0=归零最低, 100=最高, 线性插值hip/knee"},
                 },
             },
