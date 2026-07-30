@@ -1551,10 +1551,11 @@ class LegPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move_pos", "set_zero"],
+                    "action": {"type": "string", "enum": ["move_pos", "set_zero", "set_height"],
                                "description": "控制模式"},
                     "hip": {"type": "number", "description": "髋关节俯仰角(度), 范围[-40, 5], 默认0"},
                     "knee": {"type": "number", "description": "膝关节俯仰角(度), 范围[-23, 20], 默认0"},
+                    "height": {"type": "number", "description": "腿高度(0-100), 0=归零最低, 100=最高"},
                     "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
                     "current": {"type": "number", "description": "最大电流(A), 默认5.0"},
                 },
@@ -1564,6 +1565,8 @@ class LegPlugin:
                                  "description": "位置模式: 移动腿部到指定角度(度)"},
                     "set_zero": {"params": [],
                                  "description": "标零: 等价于 move_pos hip=0, knee=0"},
+                    "set_height": {"params": ["height", "speed", "current"],
+                                   "description": "高度模式: 0=归零最低, 100=最高, 线性插值hip/knee"},
                 },
             },
         }
@@ -1586,11 +1589,31 @@ class LegPlugin:
                 args.get("speed", 0.5), args.get("current", 5.0))
         if action == "set_zero":
             return self._send_pos(0, 0)
+        if action == "set_height":
+            return self._send_height(
+                args.get("height", 0),
+                args.get("speed", 0.5), args.get("current", 5.0))
         if action in ("start", "info"):
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
         return {"ok": False, "code": "INVALID_ARGUMENT", "message": f"unknown action: {action}"}
+
+    # 高度→关节角度映射（实测四点线性插值）
+    # height 0 (归零):  hip=5°,  knee=-20°
+    # height 100 (最高): hip=-40°, knee=20°
+    @staticmethod
+    def _height_to_angles(height: float) -> tuple:
+        h = max(0.0, min(100.0, height)) / 100.0  # clamp to [0,1]
+        hip_deg = 5.0 - 45.0 * h    # 5 → -40
+        knee_deg = -20.0 + 40.0 * h  # -20 → 20
+        return hip_deg, knee_deg
+
+    def _send_height(self, height: float, speed_rad_s: float = 0.5, current_a: float = 5.0) -> dict:
+        hip_deg, knee_deg = self._height_to_angles(height)
+        result = self._send_pos(hip_deg, knee_deg, speed_rad_s, current_a)
+        result["height"] = max(0.0, min(100.0, height))
+        return result
 
     def _send_pos(self, hip_deg: float, knee_deg: float, speed_rad_s: float = 0.5, current_a: float = 5.0) -> dict:
         if not self._pub_pos:
