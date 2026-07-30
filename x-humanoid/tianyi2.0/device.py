@@ -2318,14 +2318,9 @@ class AudioPlugin:
             for key, val in kwargs.items():
                 setattr(req, key, val)
 
-            future = client.call_async(req)
-            rclpy.spin_until_future_complete(self._srv_node, future, timeout_sec=self._call_timeout)
-
-            if not future.done():
-                return {"ok": False, "code": "TIMEOUT",
-                        "message": f"{svc_name} call timed out ({self._call_timeout}s)"}
-
-            resp = future.result()
+            # Synchronous call — avoids spin_until_future_complete
+            # compatibility issues with MultiThreadedExecutor.
+            resp = client.call(req)
             return {
                 "ok": True,
                 "card": "audio",
@@ -2688,14 +2683,9 @@ class DialoguePlugin:
             req.text = text
             req.id = qid
 
-            future = self._ask_client.call_async(req)
-            rclpy.spin_until_future_complete(self._srv_node, future, timeout_sec=self._call_timeout)
-
-            if not future.done():
-                return {"ok": False, "code": "TIMEOUT",
-                        "message": f"LlmAsk call timed out ({self._call_timeout}s)"}
-
-            resp = future.result()
+            # Use synchronous call() — avoids spin_until_future_complete
+            # compatibility issues with MultiThreadedExecutor.
+            resp = self._ask_client.call(req)
             return {
                 "ok": True,
                 "card": "dialogue",
