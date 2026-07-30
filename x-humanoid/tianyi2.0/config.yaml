@@ -45,6 +45,8 @@ plugins:
     enabled: true
   hand:
     enabled: true
+  gesture:
+    enabled: true
   tts:
     enabled: true
   audio:

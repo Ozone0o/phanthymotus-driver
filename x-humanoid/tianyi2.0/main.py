@@ -157,6 +157,11 @@ class TianyiDeviceBundle:
             self._plugins.append(HandPlugin(plugins_cfg["hand"], namespace, ros2))
             print("[bundle] HandPlugin loaded")
 
+        if plugins_cfg.get("gesture", {}).get("enabled", False):
+            from device import GesturePlugin
+            self._plugins.append(GesturePlugin(plugins_cfg["gesture"], namespace, ros2))
+            print("[bundle] GesturePlugin loaded")
+
         if plugins_cfg.get("tts", {}).get("enabled", False):
             from device import TtsPlugin
             self._plugins.append(TtsPlugin(plugins_cfg["tts"], namespace, ros2))

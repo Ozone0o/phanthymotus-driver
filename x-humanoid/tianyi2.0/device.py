@@ -23,6 +23,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   WaistPlugin      (actuator)           — 腰部2DOF控制
   LegPlugin        (actuator)           — 腿部2DOF控制
   HandPlugin       (actuator)           — 灵巧手控制
+  GesturePlugin    (actuator)           — 厂商预设上半身表演动作
   TtsPlugin        (actuator)           — 语音合成
   NavPlugin        (actuator)           — 底盘导航控制
   ChatPlugin       (actuator)           — 语音交互开关
@@ -2007,6 +2008,105 @@ class HandPlugin:
             return {"state": "moving", "side": side, "angles": angles}
         except Exception as e:
             return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GesturePlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GesturePlugin:
+    """调用天轶运控已封装的上半身预设动作。"""
+
+    _MOTION_IDS = {
+        "wave": 1,
+        "handshake": 2,
+        "group_photo": 3,
+        "dance": 4,
+    }
+    _MOTION_LABELS = {
+        "wave": "挥手",
+        "handshake": "握手",
+        "group_photo": "合影",
+        "dance": "舞蹈",
+    }
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ros2 = ros2
+        self._node = Node("tianyi2_gesture", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._node)
+        self._client = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "gesture",
+            "type": "actuator",
+            "description": "天轶2.0 上半身预设动作 — 挥手、握手、合影、舞蹈（调用厂商运控预设，不生成关节轨迹）",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": list(self._MOTION_IDS),
+                        "description": "要执行的预设上半身动作",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    name: {"params": [], "description": label}
+                    for name, label in self._MOTION_LABELS.items()
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from hric_msgs.srv import SetMotionNumber
+            self._client = self._node.create_client(
+                SetMotionNumber, "/hric/motion/set_motion_number")
+            print("[GesturePlugin] client created (/hric/motion/set_motion_number)")
+        except ImportError as e:
+            print(f"[GesturePlugin] WARNING: motion service import failed ({e})")
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action not in self._MOTION_IDS:
+            return {"ok": False, "code": "INVALID_ARGUMENT", "message": f"unknown action: {action}"}
+        if not self._client:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "motion service client not initialized"}
+        if not self._client.service_is_ready():
+            return {
+                "ok": False,
+                "code": "SERVICE_UNAVAILABLE",
+                "message": "天轶预设动作服务未就绪；请确认机器人处于厂商动作控制模式",
+            }
+        try:
+            from hric_msgs.srv import SetMotionNumber
+            request = SetMotionNumber.Request()
+            request.is_motion = True
+            request.motion_number = self._MOTION_IDS[action]
+            future = self._client.call_async(request)
+            future.add_done_callback(lambda f: self._log_result(action, f))
+            return {
+                "ok": True,
+                "card": "gesture",
+                "action": action,
+                "label": self._MOTION_LABELS[action],
+                "motion_number": request.motion_number,
+                "state": "requested",
+            }
+        except Exception as e:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
+
+    def _log_result(self, action: str, future) -> None:
+        try:
+            response = future.result()
+            if not response.sucess:
+                self._node.get_logger().warning(
+                    f"preset gesture {action} rejected by motion controller")
+        except Exception as e:
+            self._node.get_logger().error(f"preset gesture {action} service call failed: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
