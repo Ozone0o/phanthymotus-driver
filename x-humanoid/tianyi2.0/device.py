@@ -1561,7 +1561,7 @@ class LegPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move_pos": {"params": ["hip", "knee", "speed", "current"],
+                    "move_pos": {"params": ["hip", "knee", "speed"],
                                  "description": "位置模式: 移动腿部到指定角度(度)"},
                     "set_zero": {"params": [],
                                  "description": "标零: 回到归零位姿 (hip=5°, knee=-20°)"},
