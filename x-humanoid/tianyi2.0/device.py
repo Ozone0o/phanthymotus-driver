@@ -1533,7 +1533,7 @@ class LegPlugin:
 
     调用格式:
       - 位置控制: {"action": "move_pos", "hip": 30, "knee": 60, "speed": 0.5, "current": 10.0}
-      - 标零:   {"action": "set_zero"}  (等价于 move_pos hip=0, knee=0)
+      - 标零:   {"action": "set_zero"}  (回到归零位姿 hip=5°, knee=-20°)
     """
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
@@ -1564,7 +1564,7 @@ class LegPlugin:
                     "move_pos": {"params": ["hip", "knee", "speed", "current"],
                                  "description": "位置模式: 移动腿部到指定角度(度)"},
                     "set_zero": {"params": [],
-                                 "description": "标零: 等价于 move_pos hip=0, knee=0"},
+                                 "description": "标零: 回到归零位姿 (hip=5°, knee=-20°)"},
                     "set_height": {"params": ["height", "speed", "current"],
                                    "description": "高度模式: 0=归零最低, 100=最高, 线性插值hip/knee"},
                 },
@@ -1588,7 +1588,7 @@ class LegPlugin:
                 args.get("hip", 0), args.get("knee", 0),
                 args.get("speed", 0.5), args.get("current", 5.0))
         if action == "set_zero":
-            return self._send_pos(0, 0)
+            return self._send_pos(5.0, -20.0)
         if action == "set_height":
             return self._send_height(
                 args.get("height", 0),
