@@ -1868,8 +1868,8 @@ class LegPlugin:
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
             msg = CmdSetMotorPosition()
             results = []
-            # hip 固定 5°, knee 由参数控制
-            for mid, deg in [(51, 5.0), (52, knee_deg)]:
+            # 仅控制 knee，不碰 hip
+            for mid, deg in [(52, knee_deg)]:
                 lim = _JOINT_LIMITS[mid]
                 pos_deg, clamped = _clamp(deg, lim[0], lim[1])
                 max_spd_rads = _rpm2rads(lim[2])
