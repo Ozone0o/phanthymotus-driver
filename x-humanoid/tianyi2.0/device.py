@@ -1712,11 +1712,11 @@ class WaistPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class LegPlugin:
-    """腿部2DOF — move_pos / set_zero (不支持 KP/KD)
+    """腿部膝关节升降 — move_pos / set_zero (hip固定5°，仅knee可控)
 
     调用格式:
-      - 位置控制: {"action": "move_pos", "hip": 30, "knee": 60, "speed": 0.5, "current": 10.0}
-      - 标零:   {"action": "set_zero"}  (回到归零位姿 hip=5°, knee=-20°)
+      - 位置控制: {"action": "move_pos", "knee": 10, "speed": 0.5}
+      - 标零:   {"action": "set_zero"}  (回到归零位姿 knee=-20°)
     """
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
@@ -1730,25 +1730,21 @@ class LegPlugin:
         return {
             "name": "leg",
             "type": "actuator",
-            "description": "天轶2.0 腿部控制 — 2DOF (hip: -40°~5°, knee: -23°~20°), 位置控制/标零",
+            "description": "天轶2.0 腿部控制 — 膝关节升降 (knee: -23°~20°), hip固定5°防俯仰",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move_pos", "set_zero", "set_height"],
+                    "action": {"type": "string", "enum": ["move_pos", "set_zero"],
                                "description": "控制模式"},
-                    "hip": {"type": "number", "description": "髋关节俯仰角(度), 范围[-40, 5], 默认0"},
                     "knee": {"type": "number", "description": "膝关节俯仰角(度), 范围[-23, 20], 默认0"},
-                    "height": {"type": "number", "description": "腿高度(0-100), 0=归零最低, 100=最高"},
                     "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move_pos": {"params": ["hip", "knee", "speed"],
-                                 "description": "位置模式: 移动腿部到指定角度(度)"},
+                    "move_pos": {"params": ["knee", "speed"],
+                                 "description": "位置模式: 移动膝关节到指定角度(度), hip固定5°"},
                     "set_zero": {"params": [],
-                                 "description": "标零: 回到归零位姿 (hip=5°, knee=-20°)"},
-                    "set_height": {"params": ["height", "speed"],
-                                   "description": "高度模式: 0=归零最低, 100=最高, 线性插值hip/knee"},
+                                 "description": "标零: 回到归零位姿 (knee=-20°)"},
                 },
             },
         }
@@ -1767,56 +1763,37 @@ class LegPlugin:
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "move_pos":
             return self._send_pos(
-                args.get("hip", 0), args.get("knee", 0),
-                args.get("speed", 0.5), args.get("current", 5.0))
+                args.get("knee", 0),
+                args.get("speed", 0.5))
         if action == "set_zero":
-            return self._send_pos(5.0, -20.0)
-        if action == "set_height":
-            return self._send_height(
-                args.get("height", 0),
-                args.get("speed", 0.5), args.get("current", 5.0))
+            return self._send_pos(-20.0)
         if action in ("start", "info"):
             return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
         return {"ok": False, "code": "INVALID_ARGUMENT", "message": f"unknown action: {action}"}
 
-    # 高度→关节角度映射（hip固定，仅knee升降，避免前后俯仰）
-    # height 0 (最低):  hip=5°,  knee=-20°
-    # height 100 (最高): hip=5°,  knee=20°
-    @staticmethod
-    def _height_to_angles(height: float) -> tuple:
-        h = max(0.0, min(100.0, height)) / 100.0  # clamp to [0,1]
-        hip_deg = 5.0                # 固定，防止前后俯仰
-        knee_deg = -20.0 + 40.0 * h  # -20 → 20
-        return hip_deg, knee_deg
-
-    def _send_height(self, height: float, speed_rad_s: float = 0.5, current_a: float = 5.0) -> dict:
-        hip_deg, knee_deg = self._height_to_angles(height)
-        result = self._send_pos(hip_deg, knee_deg, speed_rad_s, current_a)
-        result["height"] = max(0.0, min(100.0, height))
-        return result
-
-    def _send_pos(self, hip_deg: float, knee_deg: float, speed_rad_s: float = 0.5, current_a: float = 5.0) -> dict:
+    def _send_pos(self, knee_deg: float, speed_rad_s: float = 0.5) -> dict:
         if not self._pub_pos:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
             msg = CmdSetMotorPosition()
             results = []
-            for mid, deg in [(51, hip_deg), (52, knee_deg)]:
+            # hip 固定 5°, knee 由参数控制
+            for mid, deg in [(51, 5.0), (52, knee_deg)]:
                 lim = _JOINT_LIMITS[mid]
                 pos_deg, clamped = _clamp(deg, lim[0], lim[1])
                 max_spd_rads = _rpm2rads(lim[2])
                 spd, _ = _clamp(speed_rad_s, 0, max_spd_rads)
-                cur, _ = _clamp(current_a, 0, lim[3])
+                cur, _ = _clamp(5.0, 0, lim[3])
                 cmd = SetMotorPosition()
                 cmd.name = mid
                 cmd.pos = _deg2rad(pos_deg)
                 cmd.spd = spd
                 cmd.cur = cur
                 msg.cmds.append(cmd)
-                results.append({"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd, "cur_a": cur})
+                results.append({"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd})
                 if clamped:
                     return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
                             "message": f"leg joint {mid} ({_ALL_JOINTS[mid]}) pos_deg out of range [{lim[0]}°, {lim[1]}°]"}
