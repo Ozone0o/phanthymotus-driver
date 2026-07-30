@@ -1713,7 +1713,7 @@ class WaistPlugin:
     调用格式:
       - 腰偏航: {"action": "move_yaw", "yaw": 30, "speed": 0.5}
       - 膝升降: {"action": "move_knee", "knee": 10, "speed": 0.5}
-      - 标零:   {"action": "set_zero"}  (yaw=0, knee=-20°)
+      - 归零:   {"action": "set_zero", "target": "waist|knee|both"}
     """
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
@@ -1736,6 +1736,8 @@ class WaistPlugin:
                                "description": "控制模式"},
                     "yaw": {"type": "number", "description": "腰偏航角(度), 范围[-160, 180], 默认0"},
                     "knee": {"type": "number", "description": "膝关节俯仰角(度), 范围[-23, 20], 默认0"},
+                    "target": {"type": "string", "enum": ["waist", "knee", "both"],
+                               "description": "归零目标: waist=腰归零, knee=腿归零, both=同时归零"},
                     "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
                 },
                 "required": ["action"],
@@ -1744,8 +1746,8 @@ class WaistPlugin:
                                  "description": "腰部偏航: 控制yaw角度(度)"},
                     "move_knee": {"params": ["knee", "speed"],
                                   "description": "腿部升降: 控制knee角度(度)"},
-                    "set_zero": {"params": [],
-                                 "description": "标零: yaw=0, knee=-20°"},
+                    "set_zero": {"params": ["target"],
+                                 "description": "归零: target=waist 腰归零, knee 腿归零, both 同时归零"},
                 },
             },
         }
@@ -1768,12 +1770,19 @@ class WaistPlugin:
         if action == "move_knee":
             return self._send_knee(args.get("knee", 0), args.get("speed", 0.5))
         if action == "set_zero":
-            r1 = self._send_yaw(0)
-            r2 = self._send_knee(-20.0)
-            if not r1.get("ok") or not r2.get("ok"):
-                return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "set_zero failed"}
-            return {"ok": True, "card": "waist", "action": "set_zero",
-                    "applied": r1.get("applied", []) + r2.get("applied", [])}
+            target = args.get("target", "both")
+            applied = []
+            if target in ("waist", "both"):
+                r = self._send_yaw(0)
+                if not r.get("ok"):
+                    return r
+                applied += r.get("applied", [])
+            if target in ("knee", "both"):
+                r = self._send_knee(-20.0)
+                if not r.get("ok"):
+                    return r
+                applied += r.get("applied", [])
+            return {"ok": True, "card": "waist", "action": "set_zero", "target": target, "applied": applied}
         if action in ("start", "info"):
             return {"state": "ready"}
         if action == "stop":
