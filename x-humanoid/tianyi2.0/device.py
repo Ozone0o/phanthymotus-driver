@@ -780,10 +780,20 @@ class HandStatePlugin(_JsonSensor):
 
 
 class DepthCameraPlugin:
-    """Forward the newest Orbbec Z16 frame with no buffering or re-encoding."""
+    """Bridge only the newest Orbbec Z16 frame to Agent Core.
+
+    Depth frames are large and the dashboard only needs the current image.  The
+    domain-0 callback therefore never serializes or publishes a frame: it only
+    replaces the pending frame.  A domain-42 timer publishes that newest frame,
+    so a slow DDS consumer cannot make the input executor drain stale images.
+    """
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/depth"
         self._forwarded_frames = 0
+        self._latest_image = None
+        self._latest_image_lock = threading.Lock()
+        self._subscription = None
+        self._publish_timer = None
         self._sub_node = Node("tianyi2_depth_sub", context=ros2.ctx_tianyi)
         self._pub_node = Node("tianyi2_depth_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
@@ -792,22 +802,51 @@ class DepthCameraPlugin:
                 "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
     def start(self):
         from sensor_msgs.msg import Image
-        # Depth needs no conversion.  A direct, depth-one BEST_EFFORT bridge
-        # is lower-latency than a worker queue: a slow receiver can only retain
-        # the newest frame, never a backlog of old depth images.
-        latest_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
-                                history=HistoryPolicy.KEEP_LAST, depth=1,
-                                durability=DurabilityPolicy.VOLATILE)
-        self._running = True; self._pub = self._pub_node.create_publisher(Image, self._topic, latest_qos)
-        # The Orbbec depth publisher is RELIABLE; request the same policy at
-        # ingress, then use depth-one BEST_EFFORT only for the outbound bridge.
-        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_image, _RELIABLE_QOS)
-    def stop(self): self._running = False
+        latest_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        # The vendor publisher is RELIABLE.  Keep that compatible policy at
+        # ingress, but retain only one unread sample instead of the generic
+        # ten-message sensor queue.
+        ingress_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self._running = True
+        self._pub = self._pub_node.create_publisher(Image, self._topic, latest_qos)
+        self._subscription = self._sub_node.create_subscription(
+            Image, "/ob_camera_head/depth/image_raw", self._on_image, ingress_qos)
+        # Publish on the domain-42 executor.  30 Hz is a ceiling, not a frame
+        # rate target: the timer sends nothing until a newer source frame arrives.
+        self._publish_timer = self._pub_node.create_timer(1.0 / 30.0, self._publish_latest)
+    def stop(self):
+        self._running = False
+        with self._latest_image_lock:
+            self._latest_image = None
+
     def _on_image(self, msg):
         if not self._running or msg.encoding not in ("16UC1", "mono16"): return
-        # The input belongs to the domain-0 executor.  Rebuild the ROS message
-        # for the domain-42 publisher rather than sharing the callback object
-        # across contexts; this is still a raw Z16 copy, not a conversion.
+        # Never block the domain-0 executor on serialization or a slow
+        # domain-42 consumer.  Replacing this reference deliberately drops any
+        # stale frame that has not yet been published.
+        with self._latest_image_lock:
+            self._latest_image = msg
+
+    def _publish_latest(self):
+        if not self._running:
+            return
+        with self._latest_image_lock:
+            msg = self._latest_image
+            self._latest_image = None
+        if msg is None:
+            return
+        # Rebuild the message for the independent domain-42 context.  This is
+        # a raw Z16 copy; it does not convert or re-encode the depth image.
         from sensor_msgs.msg import Image
         out = Image()
         out.header = msg.header
