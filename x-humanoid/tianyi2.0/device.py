@@ -487,10 +487,10 @@ class CameraPlugin:
 
         The camera runs on the host because it owns the USB device.  Each
         container start therefore makes the vendor startup script idempotently
-        request PointCloud2, accelerometer, and gyroscope streams before
-        ensuring the service is active.  This is deliberately runtime setup,
-        not a Docker build step: a Dockerfile cannot alter a new machine's
-        systemd service or access its camera.
+        request PointCloud2, accelerometer, gyroscope, and a 640x480 depth
+        profile before ensuring the service is active. This is deliberately
+        runtime setup, not a Docker build step: a Dockerfile cannot alter a
+        new machine's systemd service or access its camera.
         """
         import subprocess
         try:
@@ -527,7 +527,8 @@ class CameraPlugin:
         script = "/home/nvidia/data/scripts/start_orbbec_camera.sh"
         launch = "ros2 launch orbbec_camera head_330_ty.launch.py"
         desired = (f"{launch} enable_point_cloud:=true "
-                   "enable_accel:=true enable_gyro:=true")
+                   "enable_accel:=true enable_gyro:=true "
+                   "depth_width:=640 depth_height:=480 depth_fps:=30")
         updater = (
             "from pathlib import Path\n"
             f"path = Path({script!r})\n"
@@ -553,7 +554,7 @@ class CameraPlugin:
             check=True, capture_output=True, text=True, timeout=10)
         changed = result.stdout.strip() == "changed"
         if changed:
-            print("[CameraPlugin] enabled Orbbec point cloud, accel, and gyro streams")
+            print("[CameraPlugin] enabled Orbbec point cloud, IMU, and 640x480 depth stream")
         return changed
 
     def stop(self):
@@ -856,11 +857,10 @@ class DepthCameraPlugin:
             msg, self._latest_image = self._latest_image, None
         if msg is None:
             return
-        # Agent Core's current depth renderer consumes a raw, headerless
-        # 640x480 Z16 payload.  The Orbbec provides 1280x720, so center-crop
-        # it to 4:3 and resize with nearest-neighbour interpolation.  This
-        # preserves depth values (unlike linear interpolation) and keeps the
-        # ROS Image metadata exactly aligned with the byte payload.
+        # Agent Core consumes a raw 640x480 Z16 payload. The camera is now
+        # requested to produce that profile directly, avoiding an upstream
+        # 1280x720 DDS transfer and any local crop/resize work. Keep the
+        # 1280x720 conversion as a compatibility fallback for old profiles.
         dashboard = self._to_dashboard_depth(msg)
         if dashboard is None:
             return
@@ -888,6 +888,8 @@ class DepthCameraPlugin:
             return None
         # Respect source row stride before interpreting its pixels as uint16.
         depth = raw[:needed].reshape(height, step)[:, :width * 2].view(self._np.uint16).reshape(height, width)
+        if width == 640 and height == 480:
+            return depth
         if width * 3 > height * 4:  # 16:9 → centered 4:3 crop
             crop_width = height * 4 // 3
             left = (width - crop_width) // 2
