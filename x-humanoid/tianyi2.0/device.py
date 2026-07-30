@@ -789,6 +789,11 @@ class DepthCameraPlugin:
     """
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/depth"
+        # A 640x480 Z16 frame is 614 KiB.  The dashboard's DDS → WebSocket
+        # path is intentionally latest-frame-only, but it still must not be
+        # fed faster than the browser can decode and paint it.
+        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 8)), 15.0))
+        self._last_published_at = 0.0
         self._forwarded_frames = 0
         self._latest_image = None
         self._latest_image_lock = threading.Lock()
@@ -824,9 +829,11 @@ class DepthCameraPlugin:
         self._pub = self._pub_node.create_publisher(Image, self._topic, latest_qos)
         self._subscription = self._sub_node.create_subscription(
             Image, "/ob_camera_head/depth/image_raw", self._on_image, ingress_qos)
-        # Publish on the domain-42 executor.  30 Hz is a ceiling, not a frame
-        # rate target: the timer sends nothing until a newer source frame arrives.
+        # Poll separately from the output limit.  When rate-limited the pending
+        # slot is retained and overwritten by new input, so the next output is
+        # always the freshest source frame rather than the oldest queued one.
         self._publish_timer = self._pub_node.create_timer(1.0 / 30.0, self._publish_latest)
+        print(f"[DepthCameraPlugin] forwarding newest Z16 frame at <= {self._max_hz:g} Hz")
     def stop(self):
         self._running = False
         with self._latest_image_lock:
@@ -844,8 +851,9 @@ class DepthCameraPlugin:
         if not self._running:
             return
         with self._latest_image_lock:
-            msg = self._latest_image
-            self._latest_image = None
+            if time.monotonic() - self._last_published_at < 1.0 / self._max_hz:
+                return
+            msg, self._latest_image = self._latest_image, None
         if msg is None:
             return
         # Agent Core's current depth renderer consumes a raw, headerless
@@ -864,6 +872,7 @@ class DepthCameraPlugin:
         out.height, out.width, out.encoding = 480, 640, "16UC1"
         out.is_bigendian, out.step, out.data = 0, 1280, dashboard.tobytes()
         self._pub.publish(out)
+        self._last_published_at = time.monotonic()
         self._forwarded_frames += 1
 
     def _to_dashboard_depth(self, msg):
