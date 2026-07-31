@@ -1860,12 +1860,11 @@ class WaistPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HandPlugin:
-    """Inspire 灵巧手控制 — gesture / set_fingers / clear_error / set_angle_flexible.
+    """Inspire 灵巧手控制 — gesture / set_fingers / clear_error.
 
-    gesture:            选择 side + 预设手势(thumbs_up/fist/victory/handshake/open_palm)。
-    set_fingers:        选择 side 后逐指输入 0-100 百分比，全量下发（未填默认0=张开）。
-    clear_error:        清除指定手所有手指关节错误锁（文档 5.7.7）。
-    set_angle_flexible: 选择 side 后逐指输入 0-100 百分比，灵活控指（只下发指定的手指，其他不动）。
+    gesture:     选择 side + 预设手势(thumbs_up/fist/victory/handshake/open_palm)。
+    set_fingers: 选择 side 后逐指输入 0-100 百分比，全量下发（未填默认0=张开）。
+    clear_error: 清除指定手所有手指关节错误锁（文档 5.7.7）。
     """
 
     # 手指ID: 1=小指, 2=无名指, 3=中指, 4=食指, 5=拇指弯曲, 6=拇指旋转
@@ -1897,8 +1896,6 @@ class HandPlugin:
         self._right_pub = None
         self._left_clear_error = None
         self._right_clear_error = None
-        self._left_angle_flexible = None
-        self._right_angle_flexible = None
         self._srv_timeout = plugin_config.get("call_timeout", 3.0)
 
     def get_tool(self) -> dict:
@@ -1910,7 +1907,7 @@ class HandPlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["gesture", "set_fingers", "clear_error", "set_angle_flexible"],
+                               "enum": ["gesture", "set_fingers", "clear_error"],
                                "description": "控制模式"},
                     "side": {"type": "string", "enum": ["left", "right", "both"],
                              "description": "控制哪只手"},
@@ -1944,10 +1941,6 @@ class HandPlugin:
                         "params": ["side"],
                         "description": "清除手指关节错误锁",
                     },
-                    "set_angle_flexible": {
-                        "params": ["side", "little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"],
-                        "description": "灵活控指: 只改变指定的手指(0=张开,100=握紧), 不填=不动",
-                    },
                 },
             },
         }
@@ -1972,16 +1965,6 @@ class HandPlugin:
             print("[HandPlugin] clear_error clients created")
         except ImportError as e:
             print(f"[HandPlugin] WARNING: clear_error service import failed ({e})")
-
-        try:
-            from bodyctrl_msgs.srv import SetAngleFlexible
-            self._left_angle_flexible = self._pub_node.create_client(
-                SetAngleFlexible, "/inspire_hand/set_angle_flexible/left_hand")
-            self._right_angle_flexible = self._pub_node.create_client(
-                SetAngleFlexible, "/inspire_hand/set_angle_flexible/right_hand")
-            print("[HandPlugin] angle_flexible clients created")
-        except ImportError as e:
-            print(f"[HandPlugin] WARNING: angle_flexible service import failed ({e})")
 
     def stop(self):
         pass
@@ -2024,22 +2007,6 @@ class HandPlugin:
             if side not in ("left", "right", "both"):
                 return {"error": "side must be left, right, or both"}
             return self._clear_error(side)
-
-        elif action == "set_angle_flexible":
-            side = args.get("side", "both")
-            if side not in ("left", "right", "both"):
-                return {"error": "side must be left, right, or both"}
-            keys = ["little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
-            # 只收集用户明确指定了的手指，不填的不下发
-            names, ratios = [], []
-            for i, k in enumerate(keys):
-                v = args.get(k)
-                if v is not None:
-                    names.append(str(i + 1))
-                    ratios.append(max(0.0, min(100.0, float(v))) / 100.0)
-            if not names:
-                return {"error": "至少需要指定一个手指"}
-            return self._call_angle_flexible(side, names, ratios)
 
         elif action in ("start", "info"):
             return {"state": "ready"}
@@ -2096,36 +2063,6 @@ class HandPlugin:
                 ok = False
         return {"ok": ok, "card": "hand", "action": "clear_error", "results": results}
 
-    def _call_angle_flexible(self, side: str, names: list, ratios: list) -> dict:
-        """灵活角度控制：只下发指定的手指，其他保持原位（文档 5.7.x set_angle_flexible）。"""
-        sides = ["left", "right"] if side == "both" else [side]
-        results = {}
-        ok = True
-        for s in sides:
-            client = self._left_angle_flexible if s == "left" else self._right_angle_flexible
-            if not client:
-                results[s] = {"ok": False, "message": "client not initialized"}
-                ok = False
-                continue
-            try:
-                if not client.wait_for_service(timeout_sec=self._srv_timeout):
-                    results[s] = {"ok": False, "message": "service not available"}
-                    ok = False
-                    continue
-                req = client.srv_type.Request()
-                req.name = names
-                req.angle_ratio = ratios
-                resp = client.call(req)
-                results[s] = {"ok": True, "accepted": resp.angle_accepted,
-                              "names": list(names), "ratios": list(ratios)}
-            except Exception as e:
-                results[s] = {"ok": False, "message": str(e)}
-                ok = False
-        return {"ok": ok, "card": "hand", "action": "set_angle_flexible", "results": results}
-
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # GesturePlugin (actuator)
 # ══════════════════════════════════════════════════════════════════════════════
 
