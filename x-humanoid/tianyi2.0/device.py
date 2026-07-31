@@ -1840,11 +1840,10 @@ class WaistPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HandPlugin:
-    """Inspire 灵巧手常用手势控制。
+    """Inspire 灵巧手控制 — 单独手指控制(set_fingers) + 预设手势(gesture).
 
-    该卡片刻意不暴露逐指角度，避免在画布中误操作灵巧手。所有手势都
-    复用经过固定标定的六指位置，由底层仍通过 Inspire 的 JointState
-    控制话题下发。
+    set_fingers: 选择 side 后逐指输入 0-100 百分比，未填默认 50。
+    gesture: 选择 side + 预设手势(thumbs_up/fist/victory/open_palm)。
     """
 
     # 手指ID: 1=小指, 2=无名指, 3=中指, 4=食指, 5=拇指弯曲, 6=拇指旋转
@@ -1877,21 +1876,41 @@ class HandPlugin:
         return {
             "name": "hand",
             "type": "actuator",
-            "description": "天轶2.0 Inspire 灵巧手常用手势 — 点赞、握拳、比耶、张开手掌",
+            "description": "天轶2.0 Inspire 灵巧手 — 单独手指控制 + 预设手势",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": list(self._GESTURE_PRESETS),
-                               "description": "要执行的常用手势"},
+                               "enum": ["set_fingers", "gesture"],
+                               "description": "控制模式: set_fingers=单独控指, gesture=预设手势"},
                     "side": {"type": "string", "enum": ["left", "right", "both"],
                              "description": "控制哪只手"},
+                    "little": {"type": "number",
+                               "description": "小指 (0=张开, 100=握紧)"},
+                    "ring": {"type": "number",
+                             "description": "无名指 (0=张开, 100=握紧)"},
+                    "middle": {"type": "number",
+                               "description": "中指 (0=张开, 100=握紧)"},
+                    "index": {"type": "number",
+                              "description": "食指 (0=张开, 100=握紧)"},
+                    "thumb_bend": {"type": "number",
+                                   "description": "拇指弯曲 (0=张开, 100=握紧)"},
+                    "thumb_rotation": {"type": "number",
+                                       "description": "拇指旋转"},
+                    "gesture": {"type": "string",
+                                "enum": list(self._GESTURE_PRESETS),
+                                "description": "预设手势名称"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    gesture: {"params": ["side"],
-                              "description": label}
-                    for gesture, label in self._GESTURE_LABELS.items()
+                    "set_fingers": {
+                        "params": ["side", "little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"],
+                        "description": "单独控制每根手指 (0=张开, 100=握紧, 不填则保持中间值50)",
+                    },
+                    "gesture": {
+                        "params": ["side", "gesture"],
+                        "description": "执行预设手势",
+                    },
                 },
             },
         }
@@ -1911,15 +1930,39 @@ class HandPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        side = args.get("side", "both")
-        if action in self._GESTURE_PRESETS:
+        if action == "set_fingers":
+            side = args.get("side", "both")
             if side not in ("left", "right", "both"):
                 return {"error": "side must be left, right, or both"}
-            result = self._send_angles(side, self._GESTURE_PRESETS[action])
+            # 从 args 读取每个手指的百分比，不填默认 50（中间值/不动）
+            keys = ["little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
+            angles = []
+            for k in keys:
+                v = args.get(k)
+                if v is None:
+                    angles.append(50)
+                else:
+                    angles.append(max(0, min(100, int(v))))
+            result = self._send_angles(side, angles)
             if "error" not in result:
-                result["gesture"] = action
-                result["gesture_label"] = self._GESTURE_LABELS[action]
+                result["mode"] = "set_fingers"
+                result["angles"] = {k: a for k, a in zip(keys, angles)}
             return result
+
+        elif action == "gesture":
+            side = args.get("side", "both")
+            if side not in ("left", "right", "both"):
+                return {"error": "side must be left, right, or both"}
+            gesture_name = args.get("gesture", "")
+            if gesture_name not in self._GESTURE_PRESETS:
+                return {"error": f"unknown gesture: {gesture_name}, valid: {list(self._GESTURE_PRESETS)}"}
+            result = self._send_angles(side, self._GESTURE_PRESETS[gesture_name])
+            if "error" not in result:
+                result["mode"] = "gesture"
+                result["gesture"] = gesture_name
+                result["gesture_label"] = self._GESTURE_LABELS[gesture_name]
+            return result
+
         elif action in ("start", "info"):
             return {"state": "ready"}
         elif action == "stop":
