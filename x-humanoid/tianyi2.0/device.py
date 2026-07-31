@@ -1842,7 +1842,7 @@ class WaistPlugin:
 class HandPlugin:
     """Inspire 灵巧手控制 — 单独手指控制(set_fingers) + 预设手势(gesture).
 
-    set_fingers: 选择 side 后逐指输入 0-100 百分比，未填默认 50。
+    set_fingers: 选择 side 后逐指输入 0-100 百分比，未填默认 0（张开）。
     gesture: 选择 side + 预设手势(thumbs_up/fist/victory/open_palm)。
     """
 
@@ -1852,7 +1852,7 @@ class HandPlugin:
     # 0 表示张开，100 表示弯曲到握紧。顺序见 _FINGER_NAMES。
     _GESTURE_PRESETS = {
         "thumbs_up": [100, 100, 100, 100, 0, 50],
-        "fist": [100, 100, 100, 100, 100, 50],
+        "fist": [100, 100, 100, 100, 100, 0],
         "victory": [100, 100, 0, 0, 70, 50],
         "open_palm": [0, 0, 0, 0, 0, 0],
     }
@@ -1905,7 +1905,7 @@ class HandPlugin:
                 "x-action-params": {
                     "set_fingers": {
                         "params": ["side", "little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"],
-                        "description": "单独控制每根手指 (0=张开, 100=握紧, 不填则保持中间值50)",
+                        "description": "单独控制每根手指 (0=张开, 100=握紧, 不填默认0)",
                     },
                     "gesture": {
                         "params": ["side", "gesture"],
@@ -1934,13 +1934,13 @@ class HandPlugin:
             side = args.get("side", "both")
             if side not in ("left", "right", "both"):
                 return {"error": "side must be left, right, or both"}
-            # 从 args 读取每个手指的百分比，不填默认 50（中间值/不动）
+            # 从 args 读取每个手指的百分比，不填默认 0（张开）
             keys = ["little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
             angles = []
             for k in keys:
                 v = args.get(k)
                 if v is None:
-                    angles.append(50)
+                    angles.append(0)
                 else:
                     angles.append(max(0, min(100, int(v))))
             result = self._send_angles(side, angles)
