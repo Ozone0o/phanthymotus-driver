@@ -1874,9 +1874,11 @@ class HandPlugin:
     # 0 表示张开，100 表示弯曲到握紧。顺序见 _FINGER_NAMES。
     _GESTURE_PRESETS = {
         "thumbs_up": [100, 100, 100, 100, 0, 0],
-        "fist": [100, 100, 100, 100, 100, 0],
+        "fist": [100, 100, 100, 100, 92, 0],
         "victory": [100, 100, 0, 0, 100, 0],
         "handshake": [50, 50, 50, 50, 0, 30],
+        "point": [100, 100, 100, 0, 92, 0],
+        "ok": [0, 0, 0, 60, 50, 50],
         "open_palm": [0, 0, 0, 0, 0, 0],
     }
 
@@ -1885,6 +1887,8 @@ class HandPlugin:
         "fist": "握拳",
         "victory": "比耶",
         "handshake": "握手",
+        "point": "指向",
+        "ok": "ok",
         "open_palm": "张开手掌",
     }
 
