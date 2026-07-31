@@ -1903,7 +1903,7 @@ class HandPlugin:
                                "enum": ["set_fingers", "gesture", "clear_error"],
                                "description": "控制模式: set_fingers=单独控指, gesture=预设手势, clear_error=清除手指错误"},
                     "side": {"type": "string", "enum": ["left", "right", "both"],
-                             "description": "控制哪只手 (clear_error 不支持 both)"},
+                             "description": "控制哪只手"},
                     "little": {"type": "number",
                                "description": "小指 (0=张开, 100=握紧)"},
                     "ring": {"type": "number",
@@ -1932,7 +1932,7 @@ class HandPlugin:
                     },
                     "clear_error": {
                         "params": ["side"],
-                        "description": "清除手指关节错误锁 (需指定 left 或 right)",
+                        "description": "清除手指关节错误锁",
                     },
                 },
             },
@@ -1997,9 +1997,9 @@ class HandPlugin:
             return result
 
         elif action == "clear_error":
-            side = args.get("side", "left")
-            if side not in ("left", "right"):
-                return {"error": "clear_error requires side=left or side=right (both not supported)"}
+            side = args.get("side", "both")
+            if side not in ("left", "right", "both"):
+                return {"error": "side must be left, right, or both"}
             return self._clear_error(side)
 
         elif action in ("start", "info"):
@@ -2035,20 +2035,27 @@ class HandPlugin:
 
     def _clear_error(self, side: str) -> dict:
         """清除指定手的所有手指关节错误锁（文档 5.7.7）。"""
-        client = self._left_clear_error if side == "left" else self._right_clear_error
-        if not client:
-            return {"ok": False, "code": "COMMUNICATION_ERROR",
-                    "message": f"clear_error client for {side} not initialized"}
-        try:
-            if not client.wait_for_service(timeout_sec=self._srv_timeout):
-                return {"ok": False, "code": "COMMUNICATION_ERROR",
-                        "message": f"clear_error service for {side} not available"}
-            req = client.srv_type.Request()
-            resp = client.call(req)
-            return {"ok": True, "card": "hand", "action": "clear_error",
-                    "side": side, "accepted": resp.setclear_error_accepted}
-        except Exception as e:
-            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
+        sides = ["left", "right"] if side == "both" else [side]
+        results = {}
+        ok = True
+        for s in sides:
+            client = self._left_clear_error if s == "left" else self._right_clear_error
+            if not client:
+                results[s] = {"ok": False, "message": "client not initialized"}
+                ok = False
+                continue
+            try:
+                if not client.wait_for_service(timeout_sec=self._srv_timeout):
+                    results[s] = {"ok": False, "message": "service not available"}
+                    ok = False
+                    continue
+                req = client.srv_type.Request()
+                resp = client.call(req)
+                results[s] = {"ok": True, "accepted": resp.setclear_error_accepted}
+            except Exception as e:
+                results[s] = {"ok": False, "message": str(e)}
+                ok = False
+        return {"ok": ok, "card": "hand", "action": "clear_error", "results": results}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
