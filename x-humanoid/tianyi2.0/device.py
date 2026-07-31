@@ -30,7 +30,6 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
 
 import json
 import math
-import struct
 import threading
 import time
 from pathlib import Path
@@ -528,7 +527,7 @@ class CameraPlugin:
         launch = "ros2 launch orbbec_camera head_330_ty.launch.py"
         desired = (f"{launch} enable_point_cloud:=true "
                    "enable_accel:=true enable_gyro:=true "
-                   "depth_width:=640 depth_height:=480 depth_fps:=30")
+                   "depth_width:=1280 depth_height:=720 depth_fps:=15")
         updater = (
             "from pathlib import Path\n"
             f"path = Path({script!r})\n"
@@ -554,7 +553,7 @@ class CameraPlugin:
             check=True, capture_output=True, text=True, timeout=10)
         changed = result.stdout.strip() == "changed"
         if changed:
-            print("[CameraPlugin] enabled Orbbec point cloud, IMU, and 640x480 depth stream")
+            print("[CameraPlugin] enabled Orbbec point cloud, IMU, and 1280x720@15 depth stream")
         return changed
 
     def stop(self):
@@ -808,20 +807,10 @@ class DepthCameraPlugin:
                 "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
     def start(self):
         from sensor_msgs.msg import Image
-        import cv2
         import numpy as np
-        self._cv2, self._np = cv2, np
+        self._np = np
         latest_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            durability=DurabilityPolicy.VOLATILE,
-        )
-        # The vendor publisher is RELIABLE.  Keep that compatible policy at
-        # ingress, but retain only one unread sample instead of the generic
-        # ten-message sensor queue.
-        ingress_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
             durability=DurabilityPolicy.VOLATILE,
@@ -829,11 +818,10 @@ class DepthCameraPlugin:
         self._running = True
         self._pub = self._pub_node.create_publisher(Image, self._topic, latest_qos)
         self._subscription = self._sub_node.create_subscription(
-            Image, "/ob_camera_head/depth/image_raw", self._on_image, ingress_qos)
-        # Poll separately from the output limit.  When rate-limited the pending
-        # slot is retained and overwritten by new input, so the next output is
-        # always the freshest source frame rather than the oldest queued one.
-        self._publish_timer = self._pub_node.create_timer(1.0 / 30.0, self._publish_latest)
+            Image, "/ob_camera_head/depth/image_raw", self._on_image, latest_qos)
+        # The timer, rather than the input callback, owns all conversion and
+        # publishing work.  At most one source frame can be pending.
+        self._publish_timer = self._pub_node.create_timer(1.0 / self._max_hz, self._publish_latest)
         print(f"[DepthCameraPlugin] forwarding newest Z16 frame at <= {self._max_hz:g} Hz")
     def stop(self):
         self._running = False
@@ -852,15 +840,12 @@ class DepthCameraPlugin:
         if not self._running:
             return
         with self._latest_image_lock:
-            if time.monotonic() - self._last_published_at < 1.0 / self._max_hz:
-                return
             msg, self._latest_image = self._latest_image, None
         if msg is None:
             return
-        # Agent Core consumes a raw 640x480 Z16 payload. The camera is now
-        # requested to produce that profile directly, avoiding an upstream
-        # 1280x720 DDS transfer and any local crop/resize work. Keep the
-        # 1280x720 conversion as a compatibility fallback for old profiles.
+        # Keep the source camera at 1280x720 for its useful field of view, but
+        # bridge only the center 640x480 Z16 card.  The slice is a NumPy view;
+        # tobytes() below is the sole output-payload copy.
         dashboard = self._to_dashboard_depth(msg)
         if dashboard is None:
             return
@@ -888,26 +873,28 @@ class DepthCameraPlugin:
             return None
         # Respect source row stride before interpreting its pixels as uint16.
         depth = raw[:needed].reshape(height, step)[:, :width * 2].view(self._np.uint16).reshape(height, width)
+        if width == 1280 and height == 720:
+            return depth[120:600, 320:960]
+        # Retain a no-resize compatibility path for an old 640x480 profile.
         if width == 640 and height == 480:
             return depth
-        if width * 3 > height * 4:  # 16:9 → centered 4:3 crop
-            crop_width = height * 4 // 3
-            left = (width - crop_width) // 2
-            depth = depth[:, left:left + crop_width]
-        elif width * 3 < height * 4:  # portrait input → centered 4:3 crop
-            crop_height = width * 3 // 4
-            top = (height - crop_height) // 2
-            depth = depth[top:top + crop_height, :]
-        return self._cv2.resize(depth, (640, 480), interpolation=self._cv2.INTER_NEAREST)
+        return None
     def dispatch(self, action, args):
         return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
 
 
 class PointCloudPlugin:
-    """Pack gravity-levelled, floor-referenced Orbbec points for Agent Core."""
+    """Publish the newest native Orbbec PointCloud2 as a sparse renderer cloud."""
     _format = "sensor/pointcloud"
     def __init__(self, plugin_config, namespace, ros2):
-        self._running = False; self._topic = f"/{namespace}/camera/head/points"; self._last = 0.0; self._intrinsics = None
+        self._running = False; self._topic = f"/{namespace}/camera/head/points"
+        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 5)), 8.0))
+        self._max_points = max(100, min(int(plugin_config.get("max_points", 10000)), 12000))
+        self._min_points = max(1, min(int(plugin_config.get("min_points", 100)), self._max_points))
+        self._min_distance_m = max(0.0, float(plugin_config.get("min_distance_m", 0.10)))
+        self._max_distance_m = max(self._min_distance_m, float(plugin_config.get("max_distance_m", 8.0)))
+        self._latest_cloud = None; self._latest_cloud_seq = 0; self._published_cloud_seq = 0
+        self._cloud_lock = threading.Lock(); self._publish_timer = None
         # The renderer's horizontal grid is Y=0.  Gravity alignment fixes the
         # orientation but leaves the camera as the origin; shift upward by the
         # head camera's floor height so the physical floor is at Y=0.
@@ -918,16 +905,19 @@ class PointCloudPlugin:
     def get_tool(self):
         return {"name": "camera_pointcloud", "type": "sensor", "description": "天轶2.0 Orbbec 头部彩色点云（限频、限点）", "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": self._format}]}
     def start(self):
-        from sensor_msgs.msg import PointCloud2, Image, CameraInfo, Imu
+        from sensor_msgs.msg import PointCloud2, Imu
         from std_msgs.msg import UInt8MultiArray
-        self._running = True; self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
-        self._sub_node.create_subscription(PointCloud2, "/ob_camera_head/depth/points", self._on_cloud, _LOW_LAT_QOS)
-        # Gemini 336 currently has its depth image enabled even when the vendor
-        # point-cloud stream is disabled.  This fallback keeps the card live.
-        self._sub_node.create_subscription(CameraInfo, "/ob_camera_head/depth/camera_info", self._on_info, _RELIABLE_QOS)
-        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_depth, _LOW_LAT_QOS)
-        self._sub_node.create_subscription(Imu, "/ob_camera_head/accel/sample", self._on_accel, _LOW_LAT_QOS)
-    def stop(self): self._running = False
+        latest_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                                history=HistoryPolicy.KEEP_LAST, depth=1,
+                                durability=DurabilityPolicy.VOLATILE)
+        self._running = True; self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, latest_qos)
+        self._sub_node.create_subscription(PointCloud2, "/ob_camera_head/depth/points", self._on_cloud, latest_qos)
+        self._sub_node.create_subscription(Imu, "/ob_camera_head/accel/sample", self._on_accel, latest_qos)
+        self._publish_timer = self._pub_node.create_timer(1.0 / self._max_hz, self._publish_latest)
+        print(f"[PointCloudPlugin] native newest-frame publisher at {self._max_hz:g} Hz, <= {self._max_points} points")
+    def stop(self):
+        self._running = False
+        with self._cloud_lock: self._latest_cloud = None
     def _on_accel(self, msg):
         """Estimate display-frame up from the camera's stationary IMU vector."""
         # Optical raw coordinates are (right, down, forward); the renderer's
@@ -976,39 +966,64 @@ class PointCloudPlugin:
         # Invert the renderer map above to pack the leveled world point.
         return -wz, wx, -wy
     def _on_cloud(self, msg):
-        if not self._running or time.monotonic() - self._last < 0.5: return
-        fields = {f.name: f.offset for f in msg.fields}
-        if not all(k in fields for k in ("x", "y", "z")): return
-        self._last = time.monotonic(); raw = bytes(msg.data); count = min(msg.width * msg.height, 10000); gravity = self._gravity_snapshot()
-        packed = bytearray(struct.pack("<II", 12, count))
-        for i in range(count):
-            base = i * msg.point_step
-            x = struct.unpack_from("<f", raw, base + fields["x"])[0]
-            y = struct.unpack_from("<f", raw, base + fields["y"])[0]
-            z = struct.unpack_from("<f", raw, base + fields["z"])[0]
-            packed.extend(struct.pack("<fff", *self._to_renderer_frame(
-                x, y, z, gravity, self._floor_offset_m)))
+        """Ingress is deliberately O(1): overwrite the one pending native frame."""
+        if not self._running: return
+        with self._cloud_lock:
+            self._latest_cloud = msg
+            self._latest_cloud_seq += 1
+
+    def _publish_latest(self):
+        if not self._running: return
+        with self._cloud_lock:
+            if self._latest_cloud_seq == self._published_cloud_seq: return
+            msg, sequence = self._latest_cloud, self._latest_cloud_seq
+        payload = self._pack_cloud(msg)
+        # Consume malformed or sparse clouds too.  They must not repeatedly
+        # consume timer CPU, and they must not replace the browser's last
+        # valid frame with an empty scene.
+        self._published_cloud_seq = sequence
+        if payload is None: return
+        # If a newer frame arrived while this one was packed, its sequence is
+        # still pending for the following tick.
         from std_msgs.msg import UInt8MultiArray
-        out = UInt8MultiArray(); out.data = list(packed); self._pub.publish(out)
-    def _on_info(self, msg): self._intrinsics = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
-    def _on_depth(self, msg):
-        if not self._running or self._intrinsics is None or time.monotonic() - self._last < 0.5: return
-        if msg.encoding not in ("16UC1", "mono16"): return
-        fx, fy, cx, cy = self._intrinsics
-        if fx <= 0 or fy <= 0: return
-        self._last = time.monotonic(); raw = bytes(msg.data); step = max(1, int(math.sqrt((msg.width * msg.height) / 10000))); gravity = self._gravity_snapshot()
-        packed = bytearray(); count = 0
-        for v in range(0, msg.height, step):
-            for u in range(0, msg.width, step):
-                d = struct.unpack_from("<H", raw, v * msg.step + u * 2)[0]
-                if d == 0: continue
-                z = d / 1000.0
-                x, y = (u - cx) * z / fx, (v - cy) * z / fy
-                packed.extend(struct.pack("<fff", *self._to_renderer_frame(
-                    x, y, z, gravity, self._floor_offset_m))); count += 1
-        if not count: return
-        from std_msgs.msg import UInt8MultiArray
-        out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)
+        out = UInt8MultiArray(); out.data = payload; self._pub.publish(out)
+
+    def _pack_cloud(self, msg):
+        """Vector-read PointCloud2 XYZ, filter/sample it, then pack bytes once."""
+        np = __import__("numpy")
+        fields = {field.name: field for field in msg.fields}
+        if not all(name in fields for name in ("x", "y", "z")) or msg.point_step <= 0: return None
+        offsets = [fields[name].offset for name in ("x", "y", "z")]
+        if any(offset < 0 or offset + 4 > msg.point_step for offset in offsets): return None
+        byte_order = ">" if msg.is_bigendian else "<"
+        dtype = np.dtype({"names": ("x", "y", "z"), "formats": (byte_order + "f4",) * 3,
+                          "offsets": offsets, "itemsize": msg.point_step})
+        count = int(msg.width) * int(msg.height)
+        if count <= 0 or len(msg.data) < int(msg.row_step) * int(msg.height): return None
+        try:
+            cloud = np.ndarray((int(msg.height), int(msg.width)), dtype=dtype, buffer=msg.data,
+                               strides=(int(msg.row_step), int(msg.point_step))).reshape(-1)
+        except (TypeError, ValueError):
+            return None
+        xyz = np.column_stack((cloud["x"], cloud["y"], cloud["z"])).astype("<f4", copy=False)
+        distance = np.linalg.norm(xyz, axis=1)
+        valid = np.isfinite(xyz).all(axis=1) & (distance >= self._min_distance_m) & (distance <= self._max_distance_m)
+        xyz = xyz[valid]
+        if len(xyz) < self._min_points: return None
+        if len(xyz) > self._max_points:
+            xyz = xyz[np.linspace(0, len(xyz) - 1, self._max_points, dtype=np.intp)]
+        # Optical XYZ -> renderer packed coordinates, vectorized.  This is
+        # equivalent to _to_renderer_frame, including optional gravity level.
+        world = np.empty_like(xyz); world[:, 0] = xyz[:, 0]; world[:, 1] = -xyz[:, 1]; world[:, 2] = -xyz[:, 2]
+        gravity = self._gravity_snapshot()
+        if gravity is not None:
+            g = np.asarray(gravity, dtype=np.float32); axis = np.array([-g[2], 0.0, g[0]], dtype=np.float32)
+            sine_sq = float(axis @ axis)
+            if sine_sq > 1e-8:
+                cross = np.cross(axis, world); world += cross + ((1.0 - g[1]) / sine_sq) * np.cross(axis, cross)
+        world[:, 1] += self._floor_offset_m
+        packed_xyz = np.empty_like(world); packed_xyz[:, 0] = -world[:, 2]; packed_xyz[:, 1] = world[:, 0]; packed_xyz[:, 2] = -world[:, 1]
+        return np.asarray((12, len(packed_xyz)), dtype="<u4").tobytes() + np.ascontiguousarray(packed_xyz, dtype="<f4").tobytes()
     def dispatch(self, action, args): return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": self._format}]}
 
 

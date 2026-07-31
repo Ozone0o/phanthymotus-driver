@@ -16,11 +16,17 @@ plugins:
     enabled: true
   camera_depth:
     enabled: true
-    # Raw 640x480 Z16 is 614 KiB/frame.  Keep the dashboard stream below the
-    # browser/DDS forwarding budget and always display the newest frame.
+    # 1280x720 Z16 is cropped to 640x480 before this Domain-42 bridge.
+    # The ingress and output queues are both latest-frame-only.
     hz: 8
   camera_pointcloud:
     enabled: true
+    # Native PointCloud2 only: batch-process the newest frame on Domain 42.
+    hz: 5
+    max_points: 10000
+    min_points: 100
+    min_distance_m: 0.10
+    max_distance_m: 8.0
     # Head camera height above the floor.  The point-cloud renderer uses Y=0
     # as its grid plane, so raise the gravity-levelled cloud by this amount
     # to place the physical floor on that plane.
