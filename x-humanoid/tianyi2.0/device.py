@@ -1860,11 +1860,12 @@ class WaistPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HandPlugin:
-    """Inspire 灵巧手控制 — gesture / set_fingers / clear_error.
+    """Inspire 灵巧手控制 — gesture / set_fingers / clear_error / calibrate.
 
     gesture:     选择 side + 预设手势(thumbs_up/fist/victory/handshake/open_palm)。
     set_fingers: 选择 side 后逐指输入 0-100 百分比，全量下发（未填默认0=张开）。
     clear_error: 清除指定手所有手指关节错误锁（文档 5.7.7）。
+    calibrate:   力控校准手指零点，手指会自动运动（修复编码器漂移）。
     """
 
     # 手指ID: 1=小指, 2=无名指, 3=中指, 4=食指, 5=拇指弯曲, 6=拇指旋转
@@ -1896,6 +1897,8 @@ class HandPlugin:
         self._right_pub = None
         self._left_clear_error = None
         self._right_clear_error = None
+        self._left_calibrate = None
+        self._right_calibrate = None
         self._srv_timeout = plugin_config.get("call_timeout", 3.0)
 
     def get_tool(self) -> dict:
@@ -1907,7 +1910,7 @@ class HandPlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["gesture", "set_fingers", "clear_error"],
+                               "enum": ["gesture", "set_fingers", "clear_error", "calibrate"],
                                "description": "控制模式"},
                     "side": {"type": "string", "enum": ["left", "right", "both"],
                              "description": "控制哪只手"},
@@ -1941,6 +1944,10 @@ class HandPlugin:
                         "params": ["side"],
                         "description": "清除手指关节错误锁",
                     },
+                    "calibrate": {
+                        "params": ["side"],
+                        "description": "力控校准手指零点，手指会自动运动以重新标定位置",
+                    },
                 },
             },
         }
@@ -1965,6 +1972,16 @@ class HandPlugin:
             print("[HandPlugin] clear_error clients created")
         except ImportError as e:
             print(f"[HandPlugin] WARNING: clear_error service import failed ({e})")
+
+        try:
+            from bodyctrl_msgs.srv import SetGestureForceCalibration
+            self._left_calibrate = self._pub_node.create_client(
+                SetGestureForceCalibration, "/inspire_hand/set_gesture_force_calibration/left_hand")
+            self._right_calibrate = self._pub_node.create_client(
+                SetGestureForceCalibration, "/inspire_hand/set_gesture_force_calibration/right_hand")
+            print("[HandPlugin] calibrate clients created")
+        except ImportError as e:
+            print(f"[HandPlugin] WARNING: calibrate service import failed ({e})")
 
     def stop(self):
         pass
@@ -2007,6 +2024,12 @@ class HandPlugin:
             if side not in ("left", "right", "both"):
                 return {"error": "side must be left, right, or both"}
             return self._clear_error(side)
+
+        elif action == "calibrate":
+            side = args.get("side", "both")
+            if side not in ("left", "right", "both"):
+                return {"error": "side must be left, right, or both"}
+            return self._calibrate(side)
 
         elif action in ("start", "info"):
             return {"state": "ready"}
@@ -2063,6 +2086,32 @@ class HandPlugin:
                 ok = False
         return {"ok": ok, "card": "hand", "action": "clear_error", "results": results}
 
+
+    def _calibrate(self, side: str) -> dict:
+        """力控校准：手指自动运动以重新标定零点，修复编码器漂移。"""
+        sides = ["left", "right"] if side == "both" else [side]
+        results = {}
+        ok = True
+        for s in sides:
+            client = self._left_calibrate if s == "left" else self._right_calibrate
+            if not client:
+                results[s] = {"ok": False, "message": "client not initialized"}
+                ok = False
+                continue
+            try:
+                if not client.wait_for_service(timeout_sec=self._srv_timeout):
+                    results[s] = {"ok": False, "message": "service not available"}
+                    ok = False
+                    continue
+                req = client.srv_type.Request()
+                resp = client.call(req)
+                results[s] = {"ok": True, "accepted": resp.calibration_accepted}
+            except Exception as e:
+                results[s] = {"ok": False, "message": str(e)}
+                ok = False
+        return {"ok": ok, "card": "hand", "action": "calibrate", "results": results}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # GesturePlugin (actuator)
 # ══════════════════════════════════════════════════════════════════════════════
 
