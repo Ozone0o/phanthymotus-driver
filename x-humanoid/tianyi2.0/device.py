@@ -1860,11 +1860,13 @@ class WaistPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HandPlugin:
-    """Inspire 灵巧手控制 — set_fingers / gesture / clear_error.
+    """Inspire 灵巧手控制 — gesture / set_fingers / clear_error / set_angle_flexible / set_force.
 
-    set_fingers: 选择 side 后逐指输入 0-100 百分比，未填默认 0（张开）。
-    gesture: 选择 side + 预设手势(thumbs_up/fist/victory/open_palm)。
-    clear_error: 清除指定手(left/right)所有手指关节错误锁（文档 5.7.7）。
+    gesture:            选择 side + 预设手势(thumbs_up/fist/victory/open_palm)。
+    set_fingers:        选择 side 后逐指输入 0-100 百分比，全量下发（未填默认0=张开）。
+    clear_error:        清除指定手所有手指关节错误锁（文档 5.7.7）。
+    set_angle_flexible: 选择 side 后逐指输入 0-100 百分比，灵活控指（只下发指定的手指，其他不动）。
+    set_force:          选择 side 后逐指输入 0-100 力度百分比（100=最大抓握力≈1000g）。
     """
 
     # 手指ID: 1=小指, 2=无名指, 3=中指, 4=食指, 5=拇指弯曲, 6=拇指旋转
@@ -1894,6 +1896,10 @@ class HandPlugin:
         self._right_pub = None
         self._left_clear_error = None
         self._right_clear_error = None
+        self._left_angle_flexible = None
+        self._right_angle_flexible = None
+        self._left_force = None
+        self._right_force = None
         self._srv_timeout = plugin_config.get("call_timeout", 3.0)
 
     def get_tool(self) -> dict:
@@ -1905,8 +1911,8 @@ class HandPlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["set_fingers", "gesture", "clear_error"],
-                               "description": "控制模式: set_fingers=单独控指, gesture=预设手势, clear_error=清除手指错误"},
+                               "enum": ["gesture", "set_fingers", "clear_error", "set_angle_flexible", "set_force"],
+                               "description": "控制模式"},
                     "side": {"type": "string", "enum": ["left", "right", "both"],
                              "description": "控制哪只手"},
                     "little": {"type": "number",
@@ -1927,17 +1933,25 @@ class HandPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "set_fingers": {
-                        "params": ["side", "little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"],
-                        "description": "单独控制每根手指 (0=张开, 100=握紧, 不填默认0)",
-                    },
                     "gesture": {
                         "params": ["side", "gesture"],
-                        "description": "执行预设手势",
+                        "description": "执行预设手势 (thumbs_up/fist/victory/open_palm)",
+                    },
+                    "set_fingers": {
+                        "params": ["side", "little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"],
+                        "description": "全量控指: 逐指输入角度(0=张开,100=握紧), 不填默认0",
                     },
                     "clear_error": {
                         "params": ["side"],
                         "description": "清除手指关节错误锁",
+                    },
+                    "set_angle_flexible": {
+                        "params": ["side", "little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"],
+                        "description": "灵活控指: 只改变指定的手指(0=张开,100=握紧), 不填=不动",
+                    },
+                    "set_force": {
+                        "params": ["side", "little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"],
+                        "description": "力度控制: 逐指输入抓握力度(0=最小,100=最大≈1000g), 不填默认不变",
                     },
                 },
             },
@@ -1964,15 +1978,48 @@ class HandPlugin:
         except ImportError as e:
             print(f"[HandPlugin] WARNING: clear_error service import failed ({e})")
 
+        try:
+            from bodyctrl_msgs.srv import SetAngleFlexible
+            self._left_angle_flexible = self._pub_node.create_client(
+                SetAngleFlexible, "/inspire_hand/set_angle_flexible/left_hand")
+            self._right_angle_flexible = self._pub_node.create_client(
+                SetAngleFlexible, "/inspire_hand/set_angle_flexible/right_hand")
+            print("[HandPlugin] angle_flexible clients created")
+        except ImportError as e:
+            print(f"[HandPlugin] WARNING: angle_flexible service import failed ({e})")
+
+        try:
+            from bodyctrl_msgs.srv import SetForce
+            self._left_force = self._pub_node.create_client(
+                SetForce, "/inspire_hand/set_force/left_hand")
+            self._right_force = self._pub_node.create_client(
+                SetForce, "/inspire_hand/set_force/right_hand")
+            print("[HandPlugin] force clients created")
+        except ImportError as e:
+            print(f"[HandPlugin] WARNING: force service import failed ({e})")
+
     def stop(self):
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action == "set_fingers":
+        if action == "gesture":
             side = args.get("side", "both")
             if side not in ("left", "right", "both"):
                 return {"error": "side must be left, right, or both"}
-            # 从 args 读取每个手指的百分比，不填默认 0（张开）
+            gesture_name = args.get("gesture", "")
+            if gesture_name not in self._GESTURE_PRESETS:
+                return {"error": f"unknown gesture: {gesture_name}, valid: {list(self._GESTURE_PRESETS)}"}
+            result = self._send_angles(side, self._GESTURE_PRESETS[gesture_name])
+            if "error" not in result:
+                result["mode"] = "gesture"
+                result["gesture"] = gesture_name
+                result["gesture_label"] = self._GESTURE_LABELS[gesture_name]
+            return result
+
+        elif action == "set_fingers":
+            side = args.get("side", "both")
+            if side not in ("left", "right", "both"):
+                return {"error": "side must be left, right, or both"}
             keys = ["little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
             angles = []
             for k in keys:
@@ -1987,25 +2034,45 @@ class HandPlugin:
                 result["angles"] = {k: a for k, a in zip(keys, angles)}
             return result
 
-        elif action == "gesture":
-            side = args.get("side", "both")
-            if side not in ("left", "right", "both"):
-                return {"error": "side must be left, right, or both"}
-            gesture_name = args.get("gesture", "")
-            if gesture_name not in self._GESTURE_PRESETS:
-                return {"error": f"unknown gesture: {gesture_name}, valid: {list(self._GESTURE_PRESETS)}"}
-            result = self._send_angles(side, self._GESTURE_PRESETS[gesture_name])
-            if "error" not in result:
-                result["mode"] = "gesture"
-                result["gesture"] = gesture_name
-                result["gesture_label"] = self._GESTURE_LABELS[gesture_name]
-            return result
-
         elif action == "clear_error":
             side = args.get("side", "both")
             if side not in ("left", "right", "both"):
                 return {"error": "side must be left, right, or both"}
             return self._clear_error(side)
+
+        elif action == "set_angle_flexible":
+            side = args.get("side", "both")
+            if side not in ("left", "right", "both"):
+                return {"error": "side must be left, right, or both"}
+            keys = ["little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
+            # 只收集用户明确指定了的手指，不填的不下发
+            names, ratios = [], []
+            for i, k in enumerate(keys):
+                v = args.get(k)
+                if v is not None:
+                    names.append(str(i + 1))
+                    ratios.append(max(0.0, min(100.0, float(v))) / 100.0)
+            if not names:
+                return {"error": "至少需要指定一个手指"}
+            return self._call_angle_flexible(side, names, ratios)
+
+        elif action == "set_force":
+            side = args.get("side", "both")
+            if side not in ("left", "right", "both"):
+                return {"error": "side must be left, right, or both"}
+            keys = ["little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
+            # 逐指力度：0-100 → 0.0-1.0 ratio。不填则不设
+            forces = {}
+            specified = []
+            for i, k in enumerate(keys):
+                v = args.get(k)
+                if v is not None:
+                    ratio = max(0.0, min(100.0, float(v))) / 100.0
+                    forces[f"force{i}_Ratio"] = ratio
+                    specified.append(k)
+            if not specified:
+                return {"error": "至少需要指定一个手指的力度"}
+            return self._call_set_force(side, forces, specified)
 
         elif action in ("start", "info"):
             return {"state": "ready"}
@@ -2061,6 +2128,60 @@ class HandPlugin:
                 results[s] = {"ok": False, "message": str(e)}
                 ok = False
         return {"ok": ok, "card": "hand", "action": "clear_error", "results": results}
+
+    def _call_angle_flexible(self, side: str, names: list, ratios: list) -> dict:
+        """灵活角度控制：只下发指定的手指，其他保持原位（文档 5.7.x set_angle_flexible）。"""
+        sides = ["left", "right"] if side == "both" else [side]
+        results = {}
+        ok = True
+        for s in sides:
+            client = self._left_angle_flexible if s == "left" else self._right_angle_flexible
+            if not client:
+                results[s] = {"ok": False, "message": "client not initialized"}
+                ok = False
+                continue
+            try:
+                if not client.wait_for_service(timeout_sec=self._srv_timeout):
+                    results[s] = {"ok": False, "message": "service not available"}
+                    ok = False
+                    continue
+                req = client.srv_type.Request()
+                req.name = names
+                req.angle_ratio = ratios
+                resp = client.call(req)
+                results[s] = {"ok": True, "accepted": resp.angle_accepted,
+                              "names": list(names), "ratios": list(ratios)}
+            except Exception as e:
+                results[s] = {"ok": False, "message": str(e)}
+                ok = False
+        return {"ok": ok, "card": "hand", "action": "set_angle_flexible", "results": results}
+
+    def _call_set_force(self, side: str, force_fields: dict, specified: list) -> dict:
+        """力度控制：设置指定手指的抓握力（文档 5.7.x set_force）。"""
+        sides = ["left", "right"] if side == "both" else [side]
+        results = {}
+        ok = True
+        for s in sides:
+            client = self._left_force if s == "left" else self._right_force
+            if not client:
+                results[s] = {"ok": False, "message": "client not initialized"}
+                ok = False
+                continue
+            try:
+                if not client.wait_for_service(timeout_sec=self._srv_timeout):
+                    results[s] = {"ok": False, "message": "service not available"}
+                    ok = False
+                    continue
+                req = client.srv_type.Request()
+                for field, val in force_fields.items():
+                    setattr(req, field, val)
+                resp = client.call(req)
+                results[s] = {"ok": True, "force_accepted": resp.force_accepted,
+                              "specified": list(specified), "forces": {k: v for k, v in force_fields.items()}}
+            except Exception as e:
+                results[s] = {"ok": False, "message": str(e)}
+                ok = False
+        return {"ok": ok, "card": "hand", "action": "set_force", "results": results}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
