@@ -1877,6 +1877,7 @@ class HandPlugin:
         "thumbs_up": [100, 100, 100, 100, 0, 0],
         "fist": [100, 100, 100, 100, 100, 0],
         "victory": [100, 100, 0, 0, 100, 0],
+        "handshake": [50, 50, 50, 50, 0, 30],
         "open_palm": [0, 0, 0, 0, 0, 0],
     }
 
@@ -1884,6 +1885,7 @@ class HandPlugin:
         "thumbs_up": "点赞",
         "fist": "握拳",
         "victory": "比耶",
+        "handshake": "握手",
         "open_palm": "张开手掌",
     }
 
