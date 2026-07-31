@@ -1931,8 +1931,9 @@ class HandPlugin:
             return {"error": "publishers not initialized"}
         try:
             from sensor_msgs.msg import JointState
-            # Angles are in percentage (0-100), position field is percentage/100
-            positions = [a / 100.0 for a in angles]
+            # Angles are in percentage (0=open, 100=closed).
+            # Hardware maps position 1.0 → open, 0.0 → closed, so invert.
+            positions = [(100 - a) / 100.0 for a in angles]
 
             pubs = []
             if side in ("left", "both"):
