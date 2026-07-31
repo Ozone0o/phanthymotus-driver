@@ -30,6 +30,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
 
 import json
 import math
+from array import array
 import threading
 import time
 from pathlib import Path
@@ -986,7 +987,11 @@ class PointCloudPlugin:
         # If a newer frame arrived while this one was packed, its sequence is
         # still pending for the following tick.
         from std_msgs.msg import UInt8MultiArray
-        out = UInt8MultiArray(); out.data = payload; self._pub.publish(out)
+        # rclpy expands a ``bytes`` object element-by-element when assigning
+        # it to UInt8MultiArray.data.  For a 120 KiB cloud that takes tens of
+        # seconds and blocks the shared Domain-42 executor (including depth).
+        # array('B') is the generated message's native uint8 container.
+        out = UInt8MultiArray(); out.data = array("B", payload); self._pub.publish(out)
 
     def _pack_cloud(self, msg):
         """Vector-read PointCloud2 XYZ, filter/sample it, then pack bytes once."""
