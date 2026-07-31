@@ -1855,10 +1855,11 @@ class WaistPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HandPlugin:
-    """Inspire 灵巧手控制 — 单独手指控制(set_fingers) + 预设手势(gesture).
+    """Inspire 灵巧手控制 — set_fingers / gesture / clear_error.
 
     set_fingers: 选择 side 后逐指输入 0-100 百分比，未填默认 0（张开）。
     gesture: 选择 side + 预设手势(thumbs_up/fist/victory/open_palm)。
+    clear_error: 清除指定手(left/right)所有手指关节错误锁（文档 5.7.7）。
     """
 
     # 手指ID: 1=小指, 2=无名指, 3=中指, 4=食指, 5=拇指弯曲, 6=拇指旋转
@@ -1886,6 +1887,9 @@ class HandPlugin:
         ros2.executor_tianyi.add_node(self._pub_node)
         self._left_pub = None
         self._right_pub = None
+        self._left_clear_error = None
+        self._right_clear_error = None
+        self._srv_timeout = plugin_config.get("call_timeout", 3.0)
 
     def get_tool(self) -> dict:
         return {
@@ -1896,10 +1900,10 @@ class HandPlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["set_fingers", "gesture"],
-                               "description": "控制模式: set_fingers=单独控指, gesture=预设手势"},
+                               "enum": ["set_fingers", "gesture", "clear_error"],
+                               "description": "控制模式: set_fingers=单独控指, gesture=预设手势, clear_error=清除手指错误"},
                     "side": {"type": "string", "enum": ["left", "right", "both"],
-                             "description": "控制哪只手"},
+                             "description": "控制哪只手 (clear_error 不支持 both)"},
                     "little": {"type": "number",
                                "description": "小指 (0=张开, 100=握紧)"},
                     "ring": {"type": "number",
@@ -1926,6 +1930,10 @@ class HandPlugin:
                         "params": ["side", "gesture"],
                         "description": "执行预设手势",
                     },
+                    "clear_error": {
+                        "params": ["side"],
+                        "description": "清除手指关节错误锁 (需指定 left 或 right)",
+                    },
                 },
             },
         }
@@ -1940,6 +1948,16 @@ class HandPlugin:
             print("[HandPlugin] publishers created")
         except ImportError as e:
             print(f"[HandPlugin] WARNING: msg import failed ({e})")
+
+        try:
+            from bodyctrl_msgs.srv import SetClearError
+            self._left_clear_error = self._pub_node.create_client(
+                SetClearError, "/inspire_hand/set_clear_error/left_hand")
+            self._right_clear_error = self._pub_node.create_client(
+                SetClearError, "/inspire_hand/set_clear_error/right_hand")
+            print("[HandPlugin] clear_error clients created")
+        except ImportError as e:
+            print(f"[HandPlugin] WARNING: clear_error service import failed ({e})")
 
     def stop(self):
         pass
@@ -1978,6 +1996,12 @@ class HandPlugin:
                 result["gesture_label"] = self._GESTURE_LABELS[gesture_name]
             return result
 
+        elif action == "clear_error":
+            side = args.get("side", "left")
+            if side not in ("left", "right"):
+                return {"error": "clear_error requires side=left or side=right (both not supported)"}
+            return self._clear_error(side)
+
         elif action in ("start", "info"):
             return {"state": "ready"}
         elif action == "stop":
@@ -2008,6 +2032,23 @@ class HandPlugin:
             return {"state": "moving", "side": side, "angles": angles}
         except Exception as e:
             return {"error": str(e)}
+
+    def _clear_error(self, side: str) -> dict:
+        """清除指定手的所有手指关节错误锁（文档 5.7.7）。"""
+        client = self._left_clear_error if side == "left" else self._right_clear_error
+        if not client:
+            return {"ok": False, "code": "COMMUNICATION_ERROR",
+                    "message": f"clear_error client for {side} not initialized"}
+        try:
+            if not client.wait_for_service(timeout_sec=self._srv_timeout):
+                return {"ok": False, "code": "COMMUNICATION_ERROR",
+                        "message": f"clear_error service for {side} not available"}
+            req = client.srv_type.Request()
+            resp = client.call(req)
+            return {"ok": True, "card": "hand", "action": "clear_error",
+                    "side": side, "accepted": resp.setclear_error_accepted}
+        except Exception as e:
+            return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
