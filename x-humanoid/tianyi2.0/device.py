@@ -1712,22 +1712,22 @@ class ArmPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── 腿部升降标定点位 (实测, rad) ──
-# pos51 + pos52 ≈ -0.35 (机械耦合约束), 两个关节联动保证平稳升降
+# 51(hip) + 52(knee) ≈ -0.35, 32(pitch) ≈ -51, 三电机联动保证平稳升降
 _LEG_LEVELS = [
     {},  # 占位, level 从 1 开始
-    {"level": 1, 51:  0.08734, 52: -0.34998},   # 归零位
-    {"level": 2, 51: -0.08723, 52: -0.26275},
-    {"level": 3, 51: -0.17445, 52: -0.17554},
-    {"level": 4, 51: -0.26168, 52: -0.08834},
-    {"level": 5, 51: -0.34887, 52: -0.00110},
-    {"level": 6, 51: -0.43611, 52:  0.08611},
-    {"level": 7, 51: -0.52341, 52:  0.17341},
-    {"level": 8, 51: -0.61061, 52:  0.26062},
-    {"level": 9, 51: -0.69785, 52:  0.34782},   # 最高位
+    {"level": 1, 51:  0.08709, 52: -0.35002, 32: -0.08704},   # 归零位
+    {"level": 2, 51: -0.08720, 52: -0.26279, 32:  0.08728},
+    {"level": 3, 51: -0.17443, 52: -0.17557, 32:  0.17449},
+    {"level": 4, 51: -0.26170, 52: -0.08832, 32:  0.26174},
+    {"level": 5, 51: -0.34893, 52: -0.00107, 32:  0.34897},
+    {"level": 6, 51: -0.43613, 52:  0.08618, 32:  0.43620},
+    {"level": 7, 51: -0.52336, 52:  0.17335, 32:  0.52342},
+    {"level": 8, 51: -0.61061, 52:  0.26061, 32:  0.61062},
+    {"level": 9, 51: -0.69785, 52:  0.34785, 32:  0.69785},   # 最高位
 ]
 
 class WaistPlugin:
-    """腰部偏航 + 腿部升降 (waist + leg, 俯仰角已禁用)
+    """腰部偏航 + 腿部升降 (三电机联动: hip+knee+pitch)
 
     调用格式:
       - 腰偏航: {"action": "move_waist", "yaw": 30, "speed": 0.5}
@@ -1735,7 +1735,7 @@ class WaistPlugin:
       - 腰归零: {"action": "set_zero_waist"}
       - 腿归零: {"action": "set_zero_leg"}
 
-    level: 1=归零位, 9=最高位 (基于9个实测标定点位)
+    level 1-9: 基于实测点位, 三电机(51+52+32)联动升降, 归零位=level 1
     """
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
@@ -1824,16 +1824,16 @@ class WaistPlugin:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
 
     def _send_leg_level(self, level: int, speed_rad_s: float = 0.5) -> dict:
-        """根据 level (1-9) 直接查表获取 hip(51) 和 knee(52) 的实测点位(pos/rad),
-        直接作为 cmd.pos 发送, 两个关节联动保证机器人平稳升降。
+        """三电机联动升降: 51(hip)+52(knee) → /leg/cmd_pos, 32(pitch) → /waist/cmd_pos.
+        基于实测点位查表, 不允许用户分别调节。
 
-        level 1 → pos51= 0.087, pos52=-0.350 (归零位)
-        level 5 → pos51=-0.349, pos52=-0.001 (中间位)
-        level 9 → pos51=-0.698, pos52= 0.348 (最高位)
+        level 1 (归零): 51= 0.087, 52=-0.350, 32=-0.087
+        level 5 (中间): 51=-0.349, 52=-0.001, 32= 0.349
+        level 9 (最高): 51=-0.698, 52= 0.348, 32= 0.698
 
-        标定数据: pos51 + pos52 ≈ -0.35 rad (机械耦合约束)
+        约束: pos51+pos52≈-0.35, pos32≈-pos51
         """
-        if not self._pub_leg:
+        if not self._pub_leg or not self._pub_waist:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
         level = int(level)
         if level < 1 or level > 9:
@@ -1843,27 +1843,42 @@ class WaistPlugin:
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
 
             preset = _LEG_LEVELS[level]
-            msg = CmdSetMotorPosition()
+
+            # leg: 51(hip) + 52(knee) → /leg/cmd_pos
+            msg_leg = CmdSetMotorPosition()
             results = []
             for mid in (51, 52):
-                target_rad = preset[mid]           # 实测 pos 值 (rad), 直接用作 cmd.pos
+                target_rad = preset[mid]
                 lim = _JOINT_LIMITS[mid]
-                # 用 rad 做限位检查
                 lo_rad, hi_rad = _deg2rad(lim[0]), _deg2rad(lim[1])
                 pos_rad, clamped = _clamp(target_rad, lo_rad, hi_rad)
                 spd, _ = _clamp(speed_rad_s, 0, _rpm2rads(lim[2]))
                 cmd = SetMotorPosition()
-                cmd.name = mid
-                cmd.pos = pos_rad
-                cmd.spd = spd
-                cmd.cur = 5.0
-                msg.cmds.append(cmd)
-                results.append({"name": _ALL_JOINTS[mid],
-                                "pos_rad": round(pos_rad, 5), "spd_rad_s": spd})
+                cmd.name = mid; cmd.pos = pos_rad; cmd.spd = spd; cmd.cur = 5.0
+                msg_leg.cmds.append(cmd)
+                results.append({"name": _ALL_JOINTS[mid], "pos_rad": round(pos_rad, 5)})
                 if clamped:
                     return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
-                            "message": f"leg joint {mid} ({_ALL_JOINTS[mid]}) target {target_rad:.5f} rad out of range [{lo_rad:.5f}, {hi_rad:.5f}]"}
-            self._pub_leg.publish(msg)
+                            "message": f"leg {mid} target {target_rad:.5f} rad out of range"}
+            self._pub_leg.publish(msg_leg)
+
+            # waist: 32(pitch) → /waist/cmd_pos
+            mid = 32
+            target_rad = preset[mid]
+            lim = _JOINT_LIMITS[mid]
+            lo_rad, hi_rad = _deg2rad(lim[0]), _deg2rad(lim[1])
+            pos_rad, clamped = _clamp(target_rad, lo_rad, hi_rad)
+            spd, _ = _clamp(speed_rad_s, 0, _rpm2rads(lim[2]))
+            msg_waist = CmdSetMotorPosition()
+            cmd = SetMotorPosition()
+            cmd.name = mid; cmd.pos = pos_rad; cmd.spd = spd; cmd.cur = 5.0
+            msg_waist.cmds.append(cmd)
+            results.append({"name": _ALL_JOINTS[mid], "pos_rad": round(pos_rad, 5)})
+            if clamped:
+                return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
+                        "message": f"waist {mid} target {target_rad:.5f} rad out of range"}
+            self._pub_waist.publish(msg_waist)
+
             return {"ok": True, "card": "waist", "action": "move_leg", "level": level,
                     "applied": results}
         except Exception as e:
