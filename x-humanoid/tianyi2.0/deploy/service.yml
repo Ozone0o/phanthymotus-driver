@@ -4,8 +4,6 @@ x-humanoid-tianyi2:
   privileged: true
   volumes:
     - /dev:/dev
-    # Keep generated bags on the host so they survive driver upgrades.
-    - /home/nvidia/bags:/home/nvidia/bags
   environment:
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - PYTHONUNBUFFERED=1

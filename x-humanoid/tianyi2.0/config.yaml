@@ -44,15 +44,6 @@ plugins:
     # so it remains responsive over the DDS → Agent Core WebSocket path.
     hz: 10
     max_points: 1440
-  bag_record:
-    enabled: true
-    # Self-contained recorder: this config is baked into the image so no
-    # unavailable host utils workspace is required.
-    record_config_path: /work/bag_record/config/record.json
-    output_path: /home/nvidia/bags
-    split_size_mb: 100
-    max_storage_gb: 4
-    storage_check_interval_sec: 10
   head:
     enabled: true
   arm:

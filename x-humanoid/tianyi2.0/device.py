@@ -794,10 +794,10 @@ class DepthCameraPlugin:
     """
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/depth"
-        # The source is 1280x720 Z16 (1.8 MiB).  The card needs the native
-        # image for a sharp display, while QoS depth=1 keeps it live rather
-        # than queuing old images when a browser cannot keep up.
-        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 15)), 15.0))
+        # A 640x480 Z16 frame is 614 KiB. The dashboard's DDS → WebSocket
+        # path is intentionally latest-frame-only, but it still must not be
+        # fed faster than the browser can decode and paint it.
+        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 8)), 15.0))
         self._last_published_at = 0.0
         self._forwarded_frames = 0
         self._latest_image = None
@@ -812,8 +812,20 @@ class DepthCameraPlugin:
                 "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
     def start(self):
         from sensor_msgs.msg import Image
+        import cv2
+        import numpy as np
+        self._cv2, self._np = cv2, np
         latest_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        # The vendor publisher is RELIABLE.  Keep that compatible policy at
+        # ingress, but retain only one unread sample instead of the generic
+        # ten-message sensor queue.
+        ingress_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
             durability=DurabilityPolicy.VOLATILE,
@@ -821,10 +833,11 @@ class DepthCameraPlugin:
         self._running = True
         self._pub = self._pub_node.create_publisher(Image, self._topic, latest_qos)
         self._subscription = self._sub_node.create_subscription(
-            Image, "/ob_camera_head/depth/image_raw", self._on_image, latest_qos)
-        # The timer, rather than the input callback, owns all conversion and
-        # publishing work.  At most one source frame can be pending.
-        self._publish_timer = self._pub_node.create_timer(1.0 / self._max_hz, self._publish_latest)
+            Image, "/ob_camera_head/depth/image_raw", self._on_image, ingress_qos)
+        # Poll separately from the output limit. When rate-limited the pending
+        # slot is retained and overwritten by new input, so the next output is
+        # always the freshest source frame rather than the oldest queued one.
+        self._publish_timer = self._pub_node.create_timer(1.0 / 30.0, self._publish_latest)
         print(f"[DepthCameraPlugin] forwarding newest Z16 frame at <= {self._max_hz:g} Hz")
     def stop(self):
         self._running = False
@@ -843,38 +856,63 @@ class DepthCameraPlugin:
         if not self._running:
             return
         with self._latest_image_lock:
+            if time.monotonic() - self._last_published_at < 1.0 / self._max_hz:
+                return
             msg, self._latest_image = self._latest_image, None
         if msg is None:
             return
-        # Do not crop, resize, or convert Z16.  Publishing the received message
-        # from the Domain-42 publisher preserves native detail and avoids the
-        # large NumPy copy that used to run for every frame.
-        if (msg.encoding not in ("16UC1", "mono16") or msg.is_bigendian or
-                msg.width <= 0 or msg.height <= 0 or msg.step < msg.width * 2):
+        # Agent Core consumes a raw 640x480 Z16 payload. The camera is now
+        # requested to produce that profile directly, avoiding an upstream
+        # 1280x720 DDS transfer and any local crop/resize work. Keep the
+        # 1280x720 conversion as a compatibility fallback for old profiles.
+        dashboard = self._to_dashboard_depth(msg)
+        if dashboard is None:
             return
-        self._pub.publish(msg)
+
+        # Rebuild the message for the independent domain-42 context.
+        from sensor_msgs.msg import Image
+        out = Image()
+        out.header = msg.header
+        out.height, out.width, out.encoding = 480, 640, "16UC1"
+        out.is_bigendian, out.step, out.data = 0, 1280, dashboard.tobytes()
+        self._pub.publish(out)
         self._last_published_at = time.monotonic()
         self._forwarded_frames += 1
 
+    def _to_dashboard_depth(self, msg):
+        """Return a 640x480 uint16 depth image, or None for malformed input."""
+        if msg.encoding not in ("16UC1", "mono16") or msg.is_bigendian:
+            return None
+        width, height, step = int(msg.width), int(msg.height), int(msg.step)
+        if width <= 0 or height <= 0 or step < width * 2:
+            return None
+        raw = self._np.frombuffer(msg.data, dtype=self._np.uint8)
+        needed = height * step
+        if raw.size < needed:
+            return None
+        # Respect source row stride before interpreting its pixels as uint16.
+        depth = raw[:needed].reshape(height, step)[:, :width * 2].view(self._np.uint16).reshape(height, width)
+        if width == 640 and height == 480:
+            return depth
+        if width * 3 > height * 4:  # 16:9 → centered 4:3 crop
+            crop_width = height * 4 // 3
+            left = (width - crop_width) // 2
+            depth = depth[:, left:left + crop_width]
+        elif width * 3 < height * 4:  # portrait input → centered 4:3 crop
+            crop_height = width * 3 // 4
+            top = (height - crop_height) // 2
+            depth = depth[top:top + crop_height, :]
+        return self._cv2.resize(depth, (640, 480), interpolation=self._cv2.INTER_NEAREST)
     def dispatch(self, action, args):
         return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
 
 
 class PointCloudPlugin:
-    """Publish the newest native Orbbec PointCloud2 as a sparse renderer cloud."""
+    """Pack gravity-levelled, floor-referenced Orbbec points for Agent Core."""
     _format = "sensor/pointcloud"
     def __init__(self, plugin_config, namespace, ros2):
-        self._running = False; self._topic = f"/{namespace}/camera/head/points"
-        # 10k packed XYZ points are about 120 KiB; 12 Hz is small enough for
-        # the dashboard transport while looking continuous to the operator.
-        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 12)), 15.0))
-        self._max_points = max(100, min(int(plugin_config.get("max_points", 10000)), 12000))
-        self._min_points = max(1, min(int(plugin_config.get("min_points", 100)), self._max_points))
-        self._min_distance_m = max(0.0, float(plugin_config.get("min_distance_m", 0.10)))
-        self._max_distance_m = max(self._min_distance_m, float(plugin_config.get("max_distance_m", 8.0)))
-        self._latest_cloud = None; self._latest_cloud_seq = 0; self._published_cloud_seq = 0
-        self._cloud_lock = threading.Lock(); self._publish_timer = None
-        # The renderer's horizontal grid is Y=0.  Gravity alignment fixes the
+        self._running = False; self._topic = f"/{namespace}/camera/head/points"; self._last = 0.0; self._intrinsics = None
+        # The renderer's horizontal grid is Y=0. Gravity alignment fixes the
         # orientation but leaves the camera as the origin; shift upward by the
         # head camera's floor height so the physical floor is at Y=0.
         self._floor_offset_m = max(-3.0, min(float(plugin_config.get("floor_offset_m", 1.50)), 3.0))
@@ -884,19 +922,16 @@ class PointCloudPlugin:
     def get_tool(self):
         return {"name": "camera_pointcloud", "type": "sensor", "description": "天轶2.0 Orbbec 头部彩色点云（限频、限点）", "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": self._format}]}
     def start(self):
-        from sensor_msgs.msg import PointCloud2, Imu
+        from sensor_msgs.msg import PointCloud2, Image, CameraInfo, Imu
         from std_msgs.msg import UInt8MultiArray
-        latest_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
-                                history=HistoryPolicy.KEEP_LAST, depth=1,
-                                durability=DurabilityPolicy.VOLATILE)
-        self._running = True; self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, latest_qos)
-        self._sub_node.create_subscription(PointCloud2, "/ob_camera_head/depth/points", self._on_cloud, latest_qos)
-        self._sub_node.create_subscription(Imu, "/ob_camera_head/accel/sample", self._on_accel, latest_qos)
-        self._publish_timer = self._pub_node.create_timer(1.0 / self._max_hz, self._publish_latest)
-        print(f"[PointCloudPlugin] native newest-frame publisher at {self._max_hz:g} Hz, <= {self._max_points} points")
-    def stop(self):
-        self._running = False
-        with self._cloud_lock: self._latest_cloud = None
+        self._running = True; self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
+        self._sub_node.create_subscription(PointCloud2, "/ob_camera_head/depth/points", self._on_cloud, _LOW_LAT_QOS)
+        # Gemini 336 currently has its depth image enabled even when the vendor
+        # point-cloud stream is disabled.  This fallback keeps the card live.
+        self._sub_node.create_subscription(CameraInfo, "/ob_camera_head/depth/camera_info", self._on_info, _RELIABLE_QOS)
+        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_depth, _LOW_LAT_QOS)
+        self._sub_node.create_subscription(Imu, "/ob_camera_head/accel/sample", self._on_accel, _LOW_LAT_QOS)
+    def stop(self): self._running = False
     def _on_accel(self, msg):
         """Estimate display-frame up from the camera's stationary IMU vector."""
         # Optical raw coordinates are (right, down, forward); the renderer's
@@ -945,88 +980,39 @@ class PointCloudPlugin:
         # Invert the renderer map above to pack the leveled world point.
         return -wz, wx, -wy
     def _on_cloud(self, msg):
-        """Ingress is deliberately O(1): overwrite the one pending native frame."""
-        if not self._running: return
-        with self._cloud_lock:
-            self._latest_cloud = msg
-            self._latest_cloud_seq += 1
-
-    def _publish_latest(self):
-        if not self._running: return
-        with self._cloud_lock:
-            if self._latest_cloud_seq == self._published_cloud_seq: return
-            msg, sequence = self._latest_cloud, self._latest_cloud_seq
-        payload = self._pack_cloud(msg)
-        # Consume malformed or sparse clouds too.  They must not repeatedly
-        # consume timer CPU, and they must not replace the browser's last
-        # valid frame with an empty scene.
-        self._published_cloud_seq = sequence
-        if payload is None: return
-        # If a newer frame arrived while this one was packed, its sequence is
-        # still pending for the following tick.
+        if not self._running or time.monotonic() - self._last < 0.5: return
+        fields = {f.name: f.offset for f in msg.fields}
+        if not all(k in fields for k in ("x", "y", "z")): return
+        self._last = time.monotonic(); raw = bytes(msg.data); count = min(msg.width * msg.height, 10000); gravity = self._gravity_snapshot()
+        packed = bytearray(struct.pack("<II", 12, count))
+        for i in range(count):
+            base = i * msg.point_step
+            x = struct.unpack_from("<f", raw, base + fields["x"])[0]
+            y = struct.unpack_from("<f", raw, base + fields["y"])[0]
+            z = struct.unpack_from("<f", raw, base + fields["z"])[0]
+            packed.extend(struct.pack("<fff", *self._to_renderer_frame(
+                x, y, z, gravity, self._floor_offset_m)))
         from std_msgs.msg import UInt8MultiArray
-        # rclpy expands a ``bytes`` object element-by-element when assigning
-        # it to UInt8MultiArray.data.  For a 120 KiB cloud that takes tens of
-        # seconds and blocks the shared Domain-42 executor (including depth).
-        # array('B') is the generated message's native uint8 container.
-        out = UInt8MultiArray(); out.data = array("B", payload); self._pub.publish(out)
-
-    def _pack_cloud(self, msg):
-        """Sample an organised PointCloud2 first, then filter and pack it.
-
-        A 1280x720 source has 921,600 points.  Selecting a stable pixel grid
-        first bounds all NumPy work to ``max_points`` and avoids the CPU spike
-        that starved depth publishing.  Unlike sampling after filtering, this
-        grid does not reshuffle every time a few depth pixels become invalid.
-        """
-        np = __import__("numpy")
-        fields = {field.name: field for field in msg.fields}
-        if not all(name in fields for name in ("x", "y", "z")) or msg.point_step <= 0: return None
-        offsets = [fields[name].offset for name in ("x", "y", "z")]
-        if any(offset < 0 or offset + 4 > msg.point_step for offset in offsets): return None
-        byte_order = ">" if msg.is_bigendian else "<"
-        dtype = np.dtype({"names": ("x", "y", "z"), "formats": (byte_order + "f4",) * 3,
-                          "offsets": offsets, "itemsize": msg.point_step})
-        count = int(msg.width) * int(msg.height)
-        if count <= 0 or len(msg.data) < int(msg.row_step) * int(msg.height): return None
-        try:
-            cloud = np.ndarray((int(msg.height), int(msg.width)), dtype=dtype, buffer=msg.data,
-                               strides=(int(msg.row_step), int(msg.point_step))).reshape(-1)
-        except (TypeError, ValueError):
-            return None
-        height, width = int(msg.height), int(msg.width)
-        if height <= 0 or width <= 0:
-            return None
-        # Keep an approximately uniform, deterministic grid with no more than
-        # max_points samples.  The same pixels are used on every frame, which
-        # keeps the visual cloud stable instead of visibly blinking/reordering.
-        grid_rows = max(1, int(math.sqrt(self._max_points * height / width)))
-        grid_cols = max(1, self._max_points // grid_rows)
-        rows = np.linspace(0, height - 1, grid_rows, dtype=np.intp)
-        cols = np.linspace(0, width - 1, grid_cols, dtype=np.intp)
-        sampled = cloud.reshape(height, width)[rows[:, None], cols]
-        xyz = np.empty((sampled.size, 3), dtype="<f4")
-        xyz[:, 0] = sampled["x"].reshape(-1)
-        xyz[:, 1] = sampled["y"].reshape(-1)
-        xyz[:, 2] = sampled["z"].reshape(-1)
-        distance = np.linalg.norm(xyz, axis=1)
-        valid = np.isfinite(xyz).all(axis=1) & (distance >= self._min_distance_m) & (distance <= self._max_distance_m)
-        xyz = xyz[valid]
-        if len(xyz) < self._min_points: return None
-        if len(xyz) > self._max_points:
-            xyz = xyz[np.linspace(0, len(xyz) - 1, self._max_points, dtype=np.intp)]
-        # Optical XYZ -> renderer packed coordinates, vectorized.  This is
-        # equivalent to _to_renderer_frame, including optional gravity level.
-        world = np.empty_like(xyz); world[:, 0] = xyz[:, 0]; world[:, 1] = -xyz[:, 1]; world[:, 2] = -xyz[:, 2]
-        gravity = self._gravity_snapshot()
-        if gravity is not None:
-            g = np.asarray(gravity, dtype=np.float32); axis = np.array([-g[2], 0.0, g[0]], dtype=np.float32)
-            sine_sq = float(axis @ axis)
-            if sine_sq > 1e-8:
-                cross = np.cross(axis, world); world += cross + ((1.0 - g[1]) / sine_sq) * np.cross(axis, cross)
-        world[:, 1] += self._floor_offset_m
-        packed_xyz = np.empty_like(world); packed_xyz[:, 0] = -world[:, 2]; packed_xyz[:, 1] = world[:, 0]; packed_xyz[:, 2] = -world[:, 1]
-        return np.asarray((12, len(packed_xyz)), dtype="<u4").tobytes() + np.ascontiguousarray(packed_xyz, dtype="<f4").tobytes()
+        out = UInt8MultiArray(); out.data = list(packed); self._pub.publish(out)
+    def _on_info(self, msg): self._intrinsics = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])
+    def _on_depth(self, msg):
+        if not self._running or self._intrinsics is None or time.monotonic() - self._last < 0.5: return
+        if msg.encoding not in ("16UC1", "mono16"): return
+        fx, fy, cx, cy = self._intrinsics
+        if fx <= 0 or fy <= 0: return
+        self._last = time.monotonic(); raw = bytes(msg.data); step = max(1, int(math.sqrt((msg.width * msg.height) / 10000))); gravity = self._gravity_snapshot()
+        packed = bytearray(); count = 0
+        for v in range(0, msg.height, step):
+            for u in range(0, msg.width, step):
+                d = struct.unpack_from("<H", raw, v * msg.step + u * 2)[0]
+                if d == 0: continue
+                z = d / 1000.0
+                x, y = (u - cx) * z / fx, (v - cy) * z / fy
+                packed.extend(struct.pack("<fff", *self._to_renderer_frame(
+                    x, y, z, gravity, self._floor_offset_m))); count += 1
+        if not count: return
+        from std_msgs.msg import UInt8MultiArray
+        out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)
     def dispatch(self, action, args): return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": self._format}]}
 
 
@@ -2535,233 +2521,6 @@ class AudioPlugin:
             return {"ok": True, "card": "audio", "action": action_name}
         except Exception as e:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BagRecordPlugin (actuator)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class BagRecordPlugin:
-    """ROS 2 topic bag 录制控制。
-
-    不依赖机器人主机上可变的 ``utils`` 工作区：topic 列表随驱动镜像发布，
-    录制通过 ``ros2 bag record`` 执行。每个文件 100 MiB 分片，目录用量超过
-    4 GiB 时删除最早的已完成录制目录。
-    """
-
-    def __init__(self, plugin_config: dict, namespace: str, ros2):
-        del namespace, ros2  # This is a local process controller, not a ROS node.
-        self._record_config_path = Path(plugin_config.get(
-            "record_config_path",
-            str(Path(__file__).parent / "bag_record" / "config" / "record.json"),
-        ))
-        self._output_path = Path(plugin_config.get("output_path", "/home/nvidia/bags"))
-        self._split_size_mb = int(plugin_config.get("split_size_mb", 100))
-        self._max_storage_gb = int(plugin_config.get("max_storage_gb", 4))
-        self._startup_timeout = float(plugin_config.get("startup_timeout_sec", 1.0))
-        self._storage_check_interval = float(plugin_config.get("storage_check_interval_sec", 10.0))
-        self._process: subprocess.Popen | None = None
-        self._started_at: float | None = None
-        self._recording_path: Path | None = None
-        self._topic_list: list[str] = []
-        self._monitor_stop = threading.Event()
-        self._monitor_thread: threading.Thread | None = None
-        self._lock = threading.Lock()
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "bag_record",
-            "type": "actuator",
-            "description": (
-                "ROS 2 topic bag录制：启动/停止/查询天轶本体关键topic录制。"
-                f"录制由 utils/record_trigger.py 管理，默认每 {self._split_size_mb} MiB 分片，"
-                f"目录最多 {self._max_storage_gb} GiB，超限自动删除最早录制。"
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["start", "stop", "status"],
-                        "description": "开始录制、停止录制或查询录制状态",
-                    },
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "start": {"params": [], "description": "按 record.json 的 topic_list 开始录制"},
-                    "stop": {"params": [], "description": "停止当前录制进程"},
-                    "status": {"params": [], "description": "获取进程、配置和存储状态"},
-                },
-            },
-        }
-
-    def start(self):
-        """No recording starts until the card explicitly receives ``start``."""
-
-    def stop(self):
-        self._stop_process()
-
-    def dispatch(self, action: str, args: dict) -> dict:
-        del args
-        if action == "start":
-            return self._start_process()
-        if action == "stop":
-            return self._stop_process()
-        if action in ("status", "info"):
-            return self._status()
-        return {"error": f"unknown action: {action}"}
-
-    def _load_topics(self) -> tuple[list[str] | None, str | None]:
-        if not self._record_config_path.is_file():
-            return None, f"record config not found: {self._record_config_path}"
-        try:
-            config = json.loads(self._record_config_path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
-            return None, f"cannot read record config: {exc}"
-        topics = config.get("topic_list")
-        if not isinstance(topics, list) or not topics or not all(isinstance(t, str) and t.startswith("/") for t in topics):
-            return None, f"record config needs a non-empty absolute topic_list: {self._record_config_path}"
-        return topics, None
-
-    def _preflight(self) -> tuple[list[str] | None, str | None]:
-        topics, error = self._load_topics()
-        if error:
-            return None, error
-        try:
-            self._output_path.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            return None, f"cannot create bag output directory: {exc}"
-        if not os.access(self._output_path, os.W_OK):
-            return None, f"bag output directory is not writable: {self._output_path}"
-        return topics, None
-
-    def _start_process(self) -> dict:
-        with self._lock:
-            if self._process and self._process.poll() is None:
-                return {"error": "bag recording is already running", **self._status_locked()}
-            topics, error = self._preflight()
-            if error:
-                return {"error": error, **self._status_locked()}
-            self._prune_storage_locked()
-            recording_name = time.strftime("tianyi_%Y%m%d_%H%M%S")
-            self._recording_path = self._output_path / recording_name
-            if self._recording_path.exists():
-                return {"error": f"recording path already exists: {self._recording_path}"}
-            try:
-                self._process = subprocess.Popen(
-                    ["ros2", "bag", "record", "--max-bag-size",
-                     str(self._split_size_mb * 1024 * 1024), "-o",
-                     str(self._recording_path), *topics],
-                    cwd=str(self._output_path),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-                self._started_at = time.time()
-                self._topic_list = topics
-                self._monitor_stop.clear()
-                self._monitor_thread = threading.Thread(
-                    target=self._monitor_storage, name="bag-storage-prune", daemon=True)
-                self._monitor_thread.start()
-            except OSError as exc:
-                self._process = None
-                self._started_at = None
-                return {"error": f"failed to launch bag recorder: {exc}"}
-
-        # A launch error commonly happens immediately (e.g. missing ROS package).
-        time.sleep(max(0.0, self._startup_timeout))
-        with self._lock:
-            if self._process and self._process.poll() is not None:
-                code = self._process.returncode
-                self._process = None
-                self._started_at = None
-                self._recording_path = None
-                self._monitor_stop.set()
-                return {"error": f"bag recorder exited during startup (exit code {code})"}
-            return {"state": "recording", "message": "bag recording started", **self._status_locked()}
-
-    def _stop_process(self) -> dict:
-        monitor_thread = None
-        with self._lock:
-            if not self._process or self._process.poll() is not None:
-                self._process = None
-                self._started_at = None
-                self._recording_path = None
-                self._monitor_stop.set()
-                return {"state": "stopped", "message": "no bag recording was running", **self._status_locked()}
-            process = self._process
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=2)
-            except ProcessLookupError:
-                pass
-            self._process = None
-            self._started_at = None
-            self._recording_path = None
-            self._monitor_stop.set()
-            monitor_thread = self._monitor_thread
-            result = {"state": "stopped", "message": "bag recording stopped", **self._status_locked()}
-        if monitor_thread and monitor_thread is not threading.current_thread():
-            monitor_thread.join(timeout=1)
-        return result
-
-    def _status(self) -> dict:
-        with self._lock:
-            return self._status_locked()
-
-    def _status_locked(self) -> dict:
-        running = bool(self._process and self._process.poll() is None)
-        if not running:
-            self._process = None
-            self._started_at = None
-            self._recording_path = None
-            self._monitor_stop.set()
-        usage_bytes = None
-        try:
-            usage_bytes = sum(p.stat().st_size for p in self._output_path.rglob("*") if p.is_file())
-        except OSError:
-            pass
-        return {
-            "state": "recording" if running else "stopped",
-            "pid": self._process.pid if running else None,
-            "started_at": self._started_at if running else None,
-            "record_config_path": str(self._record_config_path),
-            "output_path": str(self._output_path),
-            "output_usage_bytes": usage_bytes,
-            "topics": self._topic_list,
-            "recording_path": str(self._recording_path) if running and self._recording_path else None,
-            "split_size_mb": self._split_size_mb,
-            "max_storage_gb": self._max_storage_gb,
-        }
-
-    def _monitor_storage(self):
-        while not self._monitor_stop.wait(max(1.0, self._storage_check_interval)):
-            with self._lock:
-                self._prune_storage_locked()
-
-    def _prune_storage_locked(self):
-        """Keep the configured storage budget without deleting the active bag."""
-        try:
-            entries = list(self._output_path.iterdir())
-            usage = sum(p.stat().st_size for p in self._output_path.rglob("*") if p.is_file())
-            limit = self._max_storage_gb * 1024 * 1024 * 1024
-            for entry in sorted(entries, key=lambda p: p.stat().st_mtime):
-                if usage <= limit:
-                    break
-                if self._recording_path and entry == self._recording_path:
-                    continue
-                size = sum(p.stat().st_size for p in entry.rglob("*") if p.is_file()) if entry.is_dir() else entry.stat().st_size
-                if entry.is_dir():
-                    shutil.rmtree(entry)
-                else:
-                    entry.unlink()
-                usage -= size
-                print(f"[BagRecordPlugin] removed expired bag data: {entry}")
-        except OSError as exc:
-            print(f"[BagRecordPlugin] storage cleanup failed: {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
