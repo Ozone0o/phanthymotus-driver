@@ -1727,13 +1727,21 @@ class ArmPlugin:
 # WaistPlugin (actuator)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── 腿部升降标定数据 (实测, rad) ──
+# pos51 + pos52 ≈ -0.35 (机械耦合约束), 两个关节联动保证平稳升降
+_LEG_CAL = {
+    "zero":  {51:  0.08734, 52: -0.34998},   # height=0  归零位
+    "max":   {51: -0.69785, 52:  0.34782},   # height=100 最高位
+}
+
 class WaistPlugin:
-    """腰部偏航 + 腿部升降 (yaw + knee, 俯仰角已禁用)
+    """腰部偏航 + 腿部升降 (waist + leg, 俯仰角已禁用)
 
     调用格式:
-      - 腰偏航: {"action": "move_yaw", "yaw": 30, "speed": 0.5}
-      - 膝升降: {"action": "move_knee", "knee": 10, "speed": 0.5}
-      - 归零:   {"action": "set_zero", "target": "waist|knee|both"}
+      - 腰偏航: {"action": "move_waist", "yaw": 30, "speed": 0.5}
+      - 腿升降: {"action": "move_leg", "height": 50, "speed": 0.5}
+      - 腰归零: {"action": "set_zero_waist"}
+      - 腿归零: {"action": "set_zero_leg"}
     """
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
@@ -1748,26 +1756,26 @@ class WaistPlugin:
         return {
             "name": "waist",
             "type": "actuator",
-            "description": "天轶2.0 腰部偏航+腿部升降 — yaw (-120°~120°), knee (-23°~20°), 俯仰角已禁用",
+            "description": "天轶2.0 腰部偏航+腿部升降 — yaw (-120°~120°), height (0-100), 俯仰角已禁用",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move_yaw", "move_knee", "set_zero"],
+                    "action": {"type": "string", "enum": ["move_waist", "move_leg", "set_zero_waist", "set_zero_leg"],
                                "description": "控制模式"},
                     "yaw": {"type": "number", "description": "腰偏航角(度), 范围[-120, 120], 默认0"},
-                    "knee": {"type": "number", "description": "膝关节俯仰角(度), 范围[-23, 20], 默认0"},
-                    "target": {"type": "string", "enum": ["waist", "knee", "both"],
-                               "description": "归零目标: waist=腰归零, knee=腿归零, both=同时归零"},
+                    "height": {"type": "number", "description": "腿部升降高度(0-100), 0=归零位, 100=最高位, 默认0"},
                     "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move_yaw": {"params": ["yaw", "speed"],
+                    "move_waist": {"params": ["yaw", "speed"],
                                  "description": "腰部偏航: 控制yaw角度(-120°~120°)"},
-                    "move_knee": {"params": ["knee", "speed"],
-                                  "description": "腿部升降: 控制knee角度(度)"},
-                    "set_zero": {"params": ["target"],
-                                 "description": "归零: target=waist 腰归零, knee 腿归零, both 同时归零"},
+                    "move_leg": {"params": ["height", "speed"],
+                                  "description": "腿部升降: hip+knee联动, height 0-100"},
+                    "set_zero_waist": {"params": [],
+                                 "description": "腰部归零: yaw=0°"},
+                    "set_zero_leg": {"params": [],
+                                 "description": "腿部归零: height=0 (回到归零位)"},
                 },
             },
         }
@@ -1785,24 +1793,14 @@ class WaistPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action == "move_yaw":
+        if action == "move_waist":
             return self._send_yaw(args.get("yaw", 0), args.get("speed", 0.5))
-        if action == "move_knee":
-            return self._send_knee(args.get("knee", 0), args.get("speed", 0.5))
-        if action == "set_zero":
-            target = args.get("target", "both")
-            applied = []
-            if target in ("waist", "both"):
-                r = self._send_yaw(0)
-                if not r.get("ok"):
-                    return r
-                applied += r.get("applied", [])
-            if target in ("knee", "both"):
-                r = self._send_knee(-20.0)
-                if not r.get("ok"):
-                    return r
-                applied += r.get("applied", [])
-            return {"ok": True, "card": "waist", "action": "set_zero", "target": target, "applied": applied}
+        if action == "move_leg":
+            return self._send_leg_height(args.get("height", 0), args.get("speed", 0.5))
+        if action == "set_zero_waist":
+            return self._send_yaw(0)
+        if action == "set_zero_leg":
+            return self._send_leg_height(0)
         if action in ("start", "info"):
             return {"state": "ready"}
         if action == "stop":
@@ -1826,30 +1824,54 @@ class WaistPlugin:
                 return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
                         "message": f"waist yaw out of range [{lim[0]}°, {lim[1]}°]"}
             self._pub_waist.publish(msg)
-            return {"ok": True, "card": "waist", "action": "move_yaw",
+            return {"ok": True, "card": "waist", "action": "move_waist",
                     "applied": [{"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd}]}
         except Exception as e:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
 
-    def _send_knee(self, knee_deg: float, speed_rad_s: float = 0.5) -> dict:
+    def _send_leg_height(self, height: float, speed_rad_s: float = 0.5) -> dict:
+        """根据 height (0-100) 线性插值计算 hip(51) 和 knee(52) 的目标位置,
+        两个关节联动保证机器人平稳升降, 不允许用户分别调节。
+
+        height=0   → hip≈5°,  knee≈-20° (归零位)
+        height=100 → hip≈-40°, knee≈20°  (最高位)
+
+        标定数据: pos51 + pos52 ≈ -0.35 rad (机械耦合约束)
+        """
         if not self._pub_leg:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+
+            # 线性插值: t ∈ [0, 1]
+            t = height / 100.0
+            targets_rad = {}
+            for mid in (51, 52):
+                zero = _LEG_CAL["zero"][mid]
+                maxv = _LEG_CAL["max"][mid]
+                targets_rad[mid] = zero + t * (maxv - zero)
+
             msg = CmdSetMotorPosition()
-            mid = 52
-            lim = _JOINT_LIMITS[mid]
-            pos_deg, clamped = _clamp(knee_deg, lim[0], lim[1])
-            spd, _ = _clamp(speed_rad_s, 0, _rpm2rads(lim[2]))
-            cmd = SetMotorPosition()
-            cmd.name = mid; cmd.pos = _deg2rad(pos_deg); cmd.spd = spd; cmd.cur = 5.0
-            msg.cmds.append(cmd)
-            if clamped:
-                return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
-                        "message": f"leg knee out of range [{lim[0]}°, {lim[1]}°]"}
+            results = []
+            for mid in (51, 52):
+                target_deg = _rad2deg(targets_rad[mid])
+                lim = _JOINT_LIMITS[mid]
+                pos_deg, clamped = _clamp(target_deg, lim[0], lim[1])
+                spd, _ = _clamp(speed_rad_s, 0, _rpm2rads(lim[2]))
+                cmd = SetMotorPosition()
+                cmd.name = mid
+                cmd.pos = _deg2rad(pos_deg)
+                cmd.spd = spd
+                cmd.cur = 5.0
+                msg.cmds.append(cmd)
+                results.append({"name": _ALL_JOINTS[mid], "pos_deg": round(pos_deg, 3),
+                                "pos_rad": round(_deg2rad(pos_deg), 5), "spd_rad_s": spd})
+                if clamped:
+                    return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
+                            "message": f"leg joint {mid} ({_ALL_JOINTS[mid]}) target {target_deg:.1f}° out of range [{lim[0]}°, {lim[1]}°]"}
             self._pub_leg.publish(msg)
-            return {"ok": True, "card": "waist", "action": "move_knee",
-                    "applied": [{"name": _ALL_JOINTS[mid], "pos_deg": pos_deg, "spd_rad_s": spd}]}
+            return {"ok": True, "card": "waist", "action": "move_leg", "height": height,
+                    "applied": results}
         except Exception as e:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
 
