@@ -33,9 +33,7 @@ ENV AMENT_PREFIX_PATH=/tianyi_ws/install/bodyctrl_msgs:/tianyi_ws/install/hric_m
 ENV LD_LIBRARY_PATH=/tianyi_ws/install/bodyctrl_msgs/lib:/tianyi_ws/install/hric_msgs/lib:/tianyi_ws/install/lyre_msgs/lib:${LD_LIBRARY_PATH}
 
 COPY resource/ /work/resource/
-COPY bag_record/ /work/bag_record/
 COPY main.py device.py nav_client.py config.yaml driver.yaml /work/
-COPY deploy/ /deploy/
 
 EXPOSE 15708
 
