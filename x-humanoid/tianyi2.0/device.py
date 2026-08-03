@@ -1731,11 +1731,11 @@ class WaistPlugin:
 
     调用格式:
       - 腰偏航: {"action": "move_waist", "yaw": 30, "speed": 0.5}
-      - 腿升降: {"action": "move_leg", "level": 5, "speed": 0.5}
+      - 腿升降: {"action": "move_leg", "height": 50, "speed": 0.5}
       - 腰归零: {"action": "set_zero_waist"}
       - 腿归零: {"action": "set_zero_leg"}
 
-    level 1-9: 基于实测点位, 三电机(51+52+32)联动升降, 归零位=level 1
+    height: 0=最低(归零位), 100=最高, 三电机线性插值联动
     """
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
@@ -1750,26 +1750,26 @@ class WaistPlugin:
         return {
             "name": "waist",
             "type": "actuator",
-            "description": "天轶2.0 腰部偏航+腿部升降 — yaw (-120°~120°), level (1-9), 俯仰角已禁用",
+            "description": "天轶2.0 腰部偏航+腿部升降 — yaw (-120°~120°), height (0-100), 俯仰角已禁用",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["move_waist", "move_leg", "set_zero_waist", "set_zero_leg"],
                                "description": "控制模式"},
                     "yaw": {"type": "number", "description": "腰偏航角(度), 范围[-120, 120], 默认0"},
-                    "level": {"type": "integer", "description": "腿部升降档位(1-9), 1=归零位, 9=最高位, 默认1"},
+                    "height": {"type": "number", "description": "腿部升降高度(0-100), 0=最低(归零位), 100=最高, 默认0"},
                     "speed": {"type": "number", "description": "运动速度(rad/s), 默认0.5"},
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "move_waist": {"params": ["yaw", "speed"],
                                  "description": "腰部偏航: 控制yaw角度(-120°~120°)"},
-                    "move_leg": {"params": ["level", "speed"],
-                                  "description": "腿部升降: hip+knee联动, 基于9个实测点位, level 1-9"},
+                    "move_leg": {"params": ["height", "speed"],
+                                  "description": "腿部升降: 三电机联动, 线性插值, height 0-100"},
                     "set_zero_waist": {"params": [],
                                  "description": "腰部归零: yaw=0°"},
                     "set_zero_leg": {"params": [],
-                                 "description": "腿部归零: level=1 (回到归零位)"},
+                                 "description": "腿部归零: height=0 (回到归零位)"},
                 },
             },
         }
@@ -1790,11 +1790,11 @@ class WaistPlugin:
         if action == "move_waist":
             return self._send_yaw(args.get("yaw", 0), args.get("speed", 0.5))
         if action == "move_leg":
-            return self._send_leg_level(args.get("level", 1), args.get("speed", 0.5))
+            return self._send_leg_height(args.get("height", 0), args.get("speed", 0.5))
         if action == "set_zero_waist":
             return self._send_yaw(0)
         if action == "set_zero_leg":
-            return self._send_leg_level(1)
+            return self._send_leg_height(0)
         if action in ("start", "info"):
             return {"state": "ready"}
         if action == "stop":
@@ -1823,32 +1823,31 @@ class WaistPlugin:
         except Exception as e:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
 
-    def _send_leg_level(self, level: int, speed_rad_s: float = 0.5) -> dict:
-        """三电机联动升降: 51(hip)+52(knee) → /leg/cmd_pos, 32(pitch) → /waist/cmd_pos.
-        基于实测点位查表, 不允许用户分别调节。
+    def _send_leg_height(self, height: float, speed_rad_s: float = 0.5) -> dict:
+        """三电机联动升降: height 0-100 线性插值, 基于实测端点。
+        51(hip)+52(knee) → /leg/cmd_pos, 32(pitch) → /waist/cmd_pos.
 
-        level 1 (归零): 51= 0.087, 52=-0.350, 32=-0.087
-        level 5 (中间): 51=-0.349, 52=-0.001, 32= 0.349
-        level 9 (最高): 51=-0.698, 52= 0.348, 32= 0.698
+        height=0   → 51= 0.087, 52=-0.350, 32=-0.087 (归零位)
+        height=50  → 51=-0.305, 52=-0.001, 32= 0.305 (中间位)
+        height=100 → 51=-0.698, 52= 0.348, 32= 0.698 (最高位)
 
         约束: pos51+pos52≈-0.35, pos32≈-pos51
         """
         if not self._pub_leg or not self._pub_waist:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": "publisher not ready"}
-        level = int(level)
-        if level < 1 or level > 9:
-            return {"ok": False, "code": "INVALID_ARGUMENT",
-                    "message": f"level must be 1-9, got {level}"}
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
 
-            preset = _LEG_LEVELS[level]
+            # 线性插值: t ∈ [0, 1], 基于实测端点 (level 1 ↔ level 9)
+            t = height / 100.0
+            zero = _LEG_LEVELS[1]   # height=0
+            maxv = _LEG_LEVELS[9]   # height=100
 
             # leg: 51(hip) + 52(knee) → /leg/cmd_pos
             msg_leg = CmdSetMotorPosition()
             results = []
             for mid in (51, 52):
-                target_rad = preset[mid]
+                target_rad = zero[mid] + t * (maxv[mid] - zero[mid])
                 lim = _JOINT_LIMITS[mid]
                 lo_rad, hi_rad = _deg2rad(lim[0]), _deg2rad(lim[1])
                 pos_rad, clamped = _clamp(target_rad, lo_rad, hi_rad)
@@ -1864,7 +1863,7 @@ class WaistPlugin:
 
             # waist: 32(pitch) → /waist/cmd_pos
             mid = 32
-            target_rad = preset[mid]
+            target_rad = zero[mid] + t * (maxv[mid] - zero[mid])
             lim = _JOINT_LIMITS[mid]
             lo_rad, hi_rad = _deg2rad(lim[0]), _deg2rad(lim[1])
             pos_rad, clamped = _clamp(target_rad, lo_rad, hi_rad)
@@ -1879,7 +1878,7 @@ class WaistPlugin:
                         "message": f"waist {mid} target {target_rad:.5f} rad out of range"}
             self._pub_waist.publish(msg_waist)
 
-            return {"ok": True, "card": "waist", "action": "move_leg", "level": level,
+            return {"ok": True, "card": "waist", "action": "move_leg", "height": height,
                     "applied": results}
         except Exception as e:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
