@@ -1860,12 +1860,14 @@ class WaistPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class HandPlugin:
-    """Inspire 灵巧手控制 — gesture / set_fingers / clear_error / calibrate.
+    """Inspire 灵巧手控制.
 
-    gesture:     选择 side + 预设手势(thumbs_up/fist/victory/handshake/open_palm)。
-    set_fingers: 选择 side 后逐指输入 0-100 百分比，全量下发（未填默认0=张开）。
-    clear_error: 清除指定手所有手指关节错误锁（文档 5.7.7）。
-    calibrate:   力控校准手指零点，手指会自动运动（修复编码器漂移）。
+    预设手势 (action = thumbs_up / fist / victory / handshake / point / ok / open_palm):
+        选择 side (left/right/both) 直接执行对应手势。
+    set_fingers_raw (底层全量控指):
+        选择 side 后逐指输入 0-100 百分比，全量下发（未填默认0=张开）。
+    reset:
+        先清除指定手所有手指关节错误锁，再执行力控校准（手指会自动运动）。
     """
 
     # 手指ID: 1=小指, 2=无名指, 3=中指, 4=食指, 5=拇指弯曲, 6=拇指旋转
@@ -1906,16 +1908,17 @@ class HandPlugin:
         self._srv_timeout = plugin_config.get("call_timeout", 3.0)
 
     def get_tool(self) -> dict:
+        _GESTURE_ACTIONS = list(self._GESTURE_PRESETS.keys())
         return {
             "name": "hand",
             "type": "actuator",
-            "description": "天轶2.0 Inspire 灵巧手 — 单独手指控制 + 预设手势",
+            "description": "天轶2.0 Inspire 灵巧手 — 预设手势 + 底层全量控指 + 重置",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["gesture", "set_fingers", "clear_error", "calibrate"],
-                               "description": "控制模式"},
+                               "enum": _GESTURE_ACTIONS + ["set_fingers_raw", "reset"],
+                               "description": "控制模式: 预设手势(thumbs_up/fist/victory/handshake/point/ok/open_palm) | set_fingers_raw=底层全量控指 | reset=清除错误+力控校准"},
                     "side": {"type": "string", "enum": ["left", "right", "both"],
                              "description": "控制哪只手"},
                     "little": {"type": "number",
@@ -1930,27 +1933,19 @@ class HandPlugin:
                                    "description": "拇指弯曲 (0=张开, 100=握紧)"},
                     "thumb_rotation": {"type": "number",
                                        "description": "拇指旋转"},
-                    "gesture": {"type": "string",
-                                "enum": list(self._GESTURE_PRESETS),
-                                "description": "预设手势名称"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "gesture": {
-                        "params": ["side", "gesture"],
-                        "description": "执行预设手势 (thumbs_up/fist/victory/open_palm)",
-                    },
-                    "set_fingers": {
+                    **{g: {"params": ["side"],
+                           "description": f"预设手势: {self._GESTURE_LABELS[g]}"}
+                       for g in _GESTURE_ACTIONS},
+                    "set_fingers_raw": {
                         "params": ["side", "little", "ring", "middle", "index", "thumb_bend", "thumb_rotation"],
-                        "description": "全量控指: 逐指输入角度(0=张开,100=握紧), 不填默认0",
+                        "description": "底层全量控指: 逐指输入角度(0=张开,100=握紧), 不填默认0, 直接下发硬件",
                     },
-                    "clear_error": {
+                    "reset": {
                         "params": ["side"],
-                        "description": "清除手指关节错误锁",
-                    },
-                    "calibrate": {
-                        "params": ["side"],
-                        "description": "力控校准手指零点，手指会自动运动以重新标定位置",
+                        "description": "先清除手指关节错误锁，再执行力控校准零点（手指会自动运动）",
                     },
                 },
             },
@@ -1991,21 +1986,20 @@ class HandPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action == "gesture":
+        # ── 预设手势 (thumbs_up / fist / victory / handshake / point / ok / open_palm) ──
+        if action in self._GESTURE_PRESETS:
             side = args.get("side", "both")
             if side not in ("left", "right", "both"):
                 return {"error": "side must be left, right, or both"}
-            gesture_name = args.get("gesture", "")
-            if gesture_name not in self._GESTURE_PRESETS:
-                return {"error": f"unknown gesture: {gesture_name}, valid: {list(self._GESTURE_PRESETS)}"}
-            result = self._send_angles(side, self._GESTURE_PRESETS[gesture_name])
+            result = self._send_angles(side, self._GESTURE_PRESETS[action])
             if "error" not in result:
                 result["mode"] = "gesture"
-                result["gesture"] = gesture_name
-                result["gesture_label"] = self._GESTURE_LABELS[gesture_name]
+                result["gesture"] = action
+                result["gesture_label"] = self._GESTURE_LABELS[action]
             return result
 
-        elif action == "set_fingers":
+        # ── 底层全量控指 ──
+        elif action == "set_fingers_raw":
             side = args.get("side", "both")
             if side not in ("left", "right", "both"):
                 return {"error": "side must be left, right, or both"}
@@ -2019,21 +2013,20 @@ class HandPlugin:
                     angles.append(max(0, min(100, int(v))))
             result = self._send_angles(side, angles)
             if "error" not in result:
-                result["mode"] = "set_fingers"
+                result["mode"] = "set_fingers_raw"
                 result["angles"] = {k: a for k, a in zip(keys, angles)}
             return result
 
-        elif action == "clear_error":
+        # ── 重置: 先清除错误锁，再力控校准 ──
+        elif action == "reset":
             side = args.get("side", "both")
             if side not in ("left", "right", "both"):
                 return {"error": "side must be left, right, or both"}
-            return self._clear_error(side)
-
-        elif action == "calibrate":
-            side = args.get("side", "both")
-            if side not in ("left", "right", "both"):
-                return {"error": "side must be left, right, or both"}
-            return self._calibrate(side)
+            clear_result = self._clear_error(side)
+            calib_result = self._calibrate(side)
+            ok = clear_result.get("ok", False) and calib_result.get("ok", False)
+            return {"ok": ok, "card": "hand", "action": "reset",
+                    "clear_error": clear_result, "calibrate": calib_result}
 
         elif action in ("start", "info"):
             return {"state": "ready"}
