@@ -1,0 +1,17 @@
+x-humanoid-tianyi2:
+  image: __IMAGE__
+  container_name: embodied-x-humanoid-tianyi2
+  privileged: true
+  volumes:
+    - /dev:/dev
+    # Keep generated bags on the host so they survive driver upgrades.
+    - /home/nvidia/bags:/home/nvidia/bags
+  environment:
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

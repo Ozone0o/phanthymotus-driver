@@ -132,6 +132,11 @@ class TianyiDeviceBundle:
             self._plugins.append(Lidar2DPlugin(plugins_cfg["lidar_2d"], namespace, ros2, slamtec_client))
             print("[bundle] Lidar2DPlugin loaded")
 
+        if plugins_cfg.get("bag_record", {}).get("enabled", False):
+            from device import BagRecordPlugin
+            self._plugins.append(BagRecordPlugin(plugins_cfg["bag_record"], namespace, ros2))
+            print("[bundle] BagRecordPlugin loaded")
+
         if plugins_cfg.get("head", {}).get("enabled", False):
             from device import HeadPlugin
             self._plugins.append(HeadPlugin(plugins_cfg["head"], namespace, ros2))

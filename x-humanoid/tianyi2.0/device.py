@@ -31,6 +31,10 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
 import json
 import math
 from array import array
+import os
+import shutil
+import signal
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -487,7 +491,7 @@ class CameraPlugin:
 
         The camera runs on the host because it owns the USB device.  Each
         container start therefore makes the vendor startup script idempotently
-        request PointCloud2, accelerometer, gyroscope, and a 640x480 depth
+        request PointCloud2, accelerometer, gyroscope, and a 1280x720@15 depth
         profile before ensuring the service is active. This is deliberately
         runtime setup, not a Docker build step: a Dockerfile cannot alter a
         new machine's systemd service or access its camera.
@@ -790,10 +794,10 @@ class DepthCameraPlugin:
     """
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/depth"
-        # A 640x480 Z16 frame is 614 KiB.  The dashboard's DDS → WebSocket
-        # path is intentionally latest-frame-only, but it still must not be
-        # fed faster than the browser can decode and paint it.
-        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 8)), 15.0))
+        # The source is 1280x720 Z16 (1.8 MiB).  The card needs the native
+        # image for a sharp display, while QoS depth=1 keeps it live rather
+        # than queuing old images when a browser cannot keep up.
+        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 15)), 15.0))
         self._last_published_at = 0.0
         self._forwarded_frames = 0
         self._latest_image = None
@@ -808,8 +812,6 @@ class DepthCameraPlugin:
                 "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
     def start(self):
         from sensor_msgs.msg import Image
-        import numpy as np
-        self._np = np
         latest_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -844,42 +846,16 @@ class DepthCameraPlugin:
             msg, self._latest_image = self._latest_image, None
         if msg is None:
             return
-        # Keep the source camera at 1280x720 for its useful field of view, but
-        # bridge only the center 640x480 Z16 card.  The slice is a NumPy view;
-        # tobytes() below is the sole output-payload copy.
-        dashboard = self._to_dashboard_depth(msg)
-        if dashboard is None:
+        # Do not crop, resize, or convert Z16.  Publishing the received message
+        # from the Domain-42 publisher preserves native detail and avoids the
+        # large NumPy copy that used to run for every frame.
+        if (msg.encoding not in ("16UC1", "mono16") or msg.is_bigendian or
+                msg.width <= 0 or msg.height <= 0 or msg.step < msg.width * 2):
             return
-
-        # Rebuild the message for the independent domain-42 context.
-        from sensor_msgs.msg import Image
-        out = Image()
-        out.header = msg.header
-        out.height, out.width, out.encoding = 480, 640, "16UC1"
-        out.is_bigendian, out.step, out.data = 0, 1280, dashboard.tobytes()
-        self._pub.publish(out)
+        self._pub.publish(msg)
         self._last_published_at = time.monotonic()
         self._forwarded_frames += 1
 
-    def _to_dashboard_depth(self, msg):
-        """Return a 640x480 uint16 depth image, or None for malformed input."""
-        if msg.encoding not in ("16UC1", "mono16") or msg.is_bigendian:
-            return None
-        width, height, step = int(msg.width), int(msg.height), int(msg.step)
-        if width <= 0 or height <= 0 or step < width * 2:
-            return None
-        raw = self._np.frombuffer(msg.data, dtype=self._np.uint8)
-        needed = height * step
-        if raw.size < needed:
-            return None
-        # Respect source row stride before interpreting its pixels as uint16.
-        depth = raw[:needed].reshape(height, step)[:, :width * 2].view(self._np.uint16).reshape(height, width)
-        if width == 1280 and height == 720:
-            return depth[120:600, 320:960]
-        # Retain a no-resize compatibility path for an old 640x480 profile.
-        if width == 640 and height == 480:
-            return depth
-        return None
     def dispatch(self, action, args):
         return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": "image/depth-z16"}]}
 
@@ -889,7 +865,9 @@ class PointCloudPlugin:
     _format = "sensor/pointcloud"
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/points"
-        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 5)), 8.0))
+        # 10k packed XYZ points are about 120 KiB; 12 Hz is small enough for
+        # the dashboard transport while looking continuous to the operator.
+        self._max_hz = max(1.0, min(float(plugin_config.get("hz", 12)), 15.0))
         self._max_points = max(100, min(int(plugin_config.get("max_points", 10000)), 12000))
         self._min_points = max(1, min(int(plugin_config.get("min_points", 100)), self._max_points))
         self._min_distance_m = max(0.0, float(plugin_config.get("min_distance_m", 0.10)))
@@ -994,7 +972,13 @@ class PointCloudPlugin:
         out = UInt8MultiArray(); out.data = array("B", payload); self._pub.publish(out)
 
     def _pack_cloud(self, msg):
-        """Vector-read PointCloud2 XYZ, filter/sample it, then pack bytes once."""
+        """Sample an organised PointCloud2 first, then filter and pack it.
+
+        A 1280x720 source has 921,600 points.  Selecting a stable pixel grid
+        first bounds all NumPy work to ``max_points`` and avoids the CPU spike
+        that starved depth publishing.  Unlike sampling after filtering, this
+        grid does not reshuffle every time a few depth pixels become invalid.
+        """
         np = __import__("numpy")
         fields = {field.name: field for field in msg.fields}
         if not all(name in fields for name in ("x", "y", "z")) or msg.point_step <= 0: return None
@@ -1010,7 +994,21 @@ class PointCloudPlugin:
                                strides=(int(msg.row_step), int(msg.point_step))).reshape(-1)
         except (TypeError, ValueError):
             return None
-        xyz = np.column_stack((cloud["x"], cloud["y"], cloud["z"])).astype("<f4", copy=False)
+        height, width = int(msg.height), int(msg.width)
+        if height <= 0 or width <= 0:
+            return None
+        # Keep an approximately uniform, deterministic grid with no more than
+        # max_points samples.  The same pixels are used on every frame, which
+        # keeps the visual cloud stable instead of visibly blinking/reordering.
+        grid_rows = max(1, int(math.sqrt(self._max_points * height / width)))
+        grid_cols = max(1, self._max_points // grid_rows)
+        rows = np.linspace(0, height - 1, grid_rows, dtype=np.intp)
+        cols = np.linspace(0, width - 1, grid_cols, dtype=np.intp)
+        sampled = cloud.reshape(height, width)[rows[:, None], cols]
+        xyz = np.empty((sampled.size, 3), dtype="<f4")
+        xyz[:, 0] = sampled["x"].reshape(-1)
+        xyz[:, 1] = sampled["y"].reshape(-1)
+        xyz[:, 2] = sampled["z"].reshape(-1)
         distance = np.linalg.norm(xyz, axis=1)
         valid = np.isfinite(xyz).all(axis=1) & (distance >= self._min_distance_m) & (distance <= self._max_distance_m)
         xyz = xyz[valid]
@@ -2536,6 +2534,233 @@ class AudioPlugin:
             return {"ok": True, "card": "audio", "action": action_name}
         except Exception as e:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BagRecordPlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BagRecordPlugin:
+    """ROS 2 topic bag 录制控制。
+
+    不依赖机器人主机上可变的 ``utils`` 工作区：topic 列表随驱动镜像发布，
+    录制通过 ``ros2 bag record`` 执行。每个文件 100 MiB 分片，目录用量超过
+    4 GiB 时删除最早的已完成录制目录。
+    """
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        del namespace, ros2  # This is a local process controller, not a ROS node.
+        self._record_config_path = Path(plugin_config.get(
+            "record_config_path",
+            str(Path(__file__).parent / "bag_record" / "config" / "record.json"),
+        ))
+        self._output_path = Path(plugin_config.get("output_path", "/home/nvidia/bags"))
+        self._split_size_mb = int(plugin_config.get("split_size_mb", 100))
+        self._max_storage_gb = int(plugin_config.get("max_storage_gb", 4))
+        self._startup_timeout = float(plugin_config.get("startup_timeout_sec", 1.0))
+        self._storage_check_interval = float(plugin_config.get("storage_check_interval_sec", 10.0))
+        self._process: subprocess.Popen | None = None
+        self._started_at: float | None = None
+        self._recording_path: Path | None = None
+        self._topic_list: list[str] = []
+        self._monitor_stop = threading.Event()
+        self._monitor_thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "bag_record",
+            "type": "actuator",
+            "description": (
+                "ROS 2 topic bag录制：启动/停止/查询天轶本体关键topic录制。"
+                f"录制由 utils/record_trigger.py 管理，默认每 {self._split_size_mb} MiB 分片，"
+                f"目录最多 {self._max_storage_gb} GiB，超限自动删除最早录制。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "stop", "status"],
+                        "description": "开始录制、停止录制或查询录制状态",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "start": {"params": [], "description": "按 record.json 的 topic_list 开始录制"},
+                    "stop": {"params": [], "description": "停止当前录制进程"},
+                    "status": {"params": [], "description": "获取进程、配置和存储状态"},
+                },
+            },
+        }
+
+    def start(self):
+        """No recording starts until the card explicitly receives ``start``."""
+
+    def stop(self):
+        self._stop_process()
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        del args
+        if action == "start":
+            return self._start_process()
+        if action == "stop":
+            return self._stop_process()
+        if action in ("status", "info"):
+            return self._status()
+        return {"error": f"unknown action: {action}"}
+
+    def _load_topics(self) -> tuple[list[str] | None, str | None]:
+        if not self._record_config_path.is_file():
+            return None, f"record config not found: {self._record_config_path}"
+        try:
+            config = json.loads(self._record_config_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            return None, f"cannot read record config: {exc}"
+        topics = config.get("topic_list")
+        if not isinstance(topics, list) or not topics or not all(isinstance(t, str) and t.startswith("/") for t in topics):
+            return None, f"record config needs a non-empty absolute topic_list: {self._record_config_path}"
+        return topics, None
+
+    def _preflight(self) -> tuple[list[str] | None, str | None]:
+        topics, error = self._load_topics()
+        if error:
+            return None, error
+        try:
+            self._output_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return None, f"cannot create bag output directory: {exc}"
+        if not os.access(self._output_path, os.W_OK):
+            return None, f"bag output directory is not writable: {self._output_path}"
+        return topics, None
+
+    def _start_process(self) -> dict:
+        with self._lock:
+            if self._process and self._process.poll() is None:
+                return {"error": "bag recording is already running", **self._status_locked()}
+            topics, error = self._preflight()
+            if error:
+                return {"error": error, **self._status_locked()}
+            self._prune_storage_locked()
+            recording_name = time.strftime("tianyi_%Y%m%d_%H%M%S")
+            self._recording_path = self._output_path / recording_name
+            if self._recording_path.exists():
+                return {"error": f"recording path already exists: {self._recording_path}"}
+            try:
+                self._process = subprocess.Popen(
+                    ["ros2", "bag", "record", "--max-bag-size",
+                     str(self._split_size_mb * 1024 * 1024), "-o",
+                     str(self._recording_path), *topics],
+                    cwd=str(self._output_path),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                self._started_at = time.time()
+                self._topic_list = topics
+                self._monitor_stop.clear()
+                self._monitor_thread = threading.Thread(
+                    target=self._monitor_storage, name="bag-storage-prune", daemon=True)
+                self._monitor_thread.start()
+            except OSError as exc:
+                self._process = None
+                self._started_at = None
+                return {"error": f"failed to launch bag recorder: {exc}"}
+
+        # A launch error commonly happens immediately (e.g. missing ROS package).
+        time.sleep(max(0.0, self._startup_timeout))
+        with self._lock:
+            if self._process and self._process.poll() is not None:
+                code = self._process.returncode
+                self._process = None
+                self._started_at = None
+                self._recording_path = None
+                self._monitor_stop.set()
+                return {"error": f"bag recorder exited during startup (exit code {code})"}
+            return {"state": "recording", "message": "bag recording started", **self._status_locked()}
+
+    def _stop_process(self) -> dict:
+        monitor_thread = None
+        with self._lock:
+            if not self._process or self._process.poll() is not None:
+                self._process = None
+                self._started_at = None
+                self._recording_path = None
+                self._monitor_stop.set()
+                return {"state": "stopped", "message": "no bag recording was running", **self._status_locked()}
+            process = self._process
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=2)
+            except ProcessLookupError:
+                pass
+            self._process = None
+            self._started_at = None
+            self._recording_path = None
+            self._monitor_stop.set()
+            monitor_thread = self._monitor_thread
+            result = {"state": "stopped", "message": "bag recording stopped", **self._status_locked()}
+        if monitor_thread and monitor_thread is not threading.current_thread():
+            monitor_thread.join(timeout=1)
+        return result
+
+    def _status(self) -> dict:
+        with self._lock:
+            return self._status_locked()
+
+    def _status_locked(self) -> dict:
+        running = bool(self._process and self._process.poll() is None)
+        if not running:
+            self._process = None
+            self._started_at = None
+            self._recording_path = None
+            self._monitor_stop.set()
+        usage_bytes = None
+        try:
+            usage_bytes = sum(p.stat().st_size for p in self._output_path.rglob("*") if p.is_file())
+        except OSError:
+            pass
+        return {
+            "state": "recording" if running else "stopped",
+            "pid": self._process.pid if running else None,
+            "started_at": self._started_at if running else None,
+            "record_config_path": str(self._record_config_path),
+            "output_path": str(self._output_path),
+            "output_usage_bytes": usage_bytes,
+            "topics": self._topic_list,
+            "recording_path": str(self._recording_path) if running and self._recording_path else None,
+            "split_size_mb": self._split_size_mb,
+            "max_storage_gb": self._max_storage_gb,
+        }
+
+    def _monitor_storage(self):
+        while not self._monitor_stop.wait(max(1.0, self._storage_check_interval)):
+            with self._lock:
+                self._prune_storage_locked()
+
+    def _prune_storage_locked(self):
+        """Keep the configured storage budget without deleting the active bag."""
+        try:
+            entries = list(self._output_path.iterdir())
+            usage = sum(p.stat().st_size for p in self._output_path.rglob("*") if p.is_file())
+            limit = self._max_storage_gb * 1024 * 1024 * 1024
+            for entry in sorted(entries, key=lambda p: p.stat().st_mtime):
+                if usage <= limit:
+                    break
+                if self._recording_path and entry == self._recording_path:
+                    continue
+                size = sum(p.stat().st_size for p in entry.rglob("*") if p.is_file()) if entry.is_dir() else entry.stat().st_size
+                if entry.is_dir():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+                usage -= size
+                print(f"[BagRecordPlugin] removed expired bag data: {entry}")
+        except OSError as exc:
+            print(f"[BagRecordPlugin] storage cleanup failed: {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

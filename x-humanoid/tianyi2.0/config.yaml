@@ -16,13 +16,16 @@ plugins:
     enabled: true
   camera_depth:
     enabled: true
-    # 1280x720 Z16 is cropped to 640x480 before this Domain-42 bridge.
-    # The ingress and output queues are both latest-frame-only.
-    hz: 8
+    # Forward the native 1280x720 Z16 frame.  Keeping the source resolution
+    # avoids the blurry centre-crop previously shown by the dashboard card.
+    # Both sides are latest-frame-only, so a slow renderer drops frames rather
+    # than accumulating latency.
+    hz: 15
   camera_pointcloud:
     enabled: true
-    # Native PointCloud2 only: batch-process the newest frame on Domain 42.
-    hz: 5
+    # Sample the organised cloud before XYZ conversion; never process all
+    # 1280x720 source points in the Domain-42 executor.
+    hz: 12
     max_points: 10000
     min_points: 100
     min_distance_m: 0.10
@@ -41,6 +44,15 @@ plugins:
     # so it remains responsive over the DDS → Agent Core WebSocket path.
     hz: 10
     max_points: 1440
+  bag_record:
+    enabled: true
+    # Self-contained recorder: this config is baked into the image so no
+    # unavailable host utils workspace is required.
+    record_config_path: /work/bag_record/config/record.json
+    output_path: /home/nvidia/bags
+    split_size_mb: 100
+    max_storage_gb: 4
+    storage_check_interval_sec: 10
   head:
     enabled: true
   arm:

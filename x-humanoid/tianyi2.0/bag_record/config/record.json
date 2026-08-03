@@ -1,0 +1,13 @@
+{
+  "topic_list": [
+    "/bodycontrol_state",
+    "/head/status",
+    "/arm/status",
+    "/waist/status",
+    "/leg/status",
+    "/power/battery/status",
+    "/power/board/key_status",
+    "/imu/status",
+    "/cmd_vel"
+  ]
+}
