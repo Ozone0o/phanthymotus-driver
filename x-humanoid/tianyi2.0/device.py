@@ -1838,12 +1838,12 @@ class WaistPlugin:
             return {"ok": False, "code": "COMMUNICATION_ERROR", "message": str(e)}
 
     def _send_leg_level(self, level: int, speed_rad_s: float = 0.5) -> dict:
-        """根据 level (1-9) 直接查表获取 hip(51) 和 knee(52) 的实测点位,
-        两个关节联动保证机器人平稳升降, 不允许用户分别调节。
+        """根据 level (1-9) 直接查表获取 hip(51) 和 knee(52) 的实测点位(pos/rad),
+        直接作为 cmd.pos 发送, 两个关节联动保证机器人平稳升降。
 
-        level 1 → hip≈5°,   knee≈-20° (归零位)
-        level 5 → hip≈-17°, knee≈0°   (中间位)
-        level 9 → hip≈-40°, knee≈20°  (最高位)
+        level 1 → pos51= 0.087, pos52=-0.350 (归零位)
+        level 5 → pos51=-0.349, pos52=-0.001 (中间位)
+        level 9 → pos51=-0.698, pos52= 0.348 (最高位)
 
         标定数据: pos51 + pos52 ≈ -0.35 rad (机械耦合约束)
         """
@@ -1860,22 +1860,23 @@ class WaistPlugin:
             msg = CmdSetMotorPosition()
             results = []
             for mid in (51, 52):
-                target_rad = preset[mid]
-                target_deg = _rad2deg(target_rad)
+                target_rad = preset[mid]           # 实测 pos 值 (rad), 直接用作 cmd.pos
                 lim = _JOINT_LIMITS[mid]
-                pos_deg, clamped = _clamp(target_deg, lim[0], lim[1])
+                # 用 rad 做限位检查
+                lo_rad, hi_rad = _deg2rad(lim[0]), _deg2rad(lim[1])
+                pos_rad, clamped = _clamp(target_rad, lo_rad, hi_rad)
                 spd, _ = _clamp(speed_rad_s, 0, _rpm2rads(lim[2]))
                 cmd = SetMotorPosition()
                 cmd.name = mid
-                cmd.pos = _deg2rad(pos_deg)
+                cmd.pos = pos_rad
                 cmd.spd = spd
                 cmd.cur = 5.0
                 msg.cmds.append(cmd)
-                results.append({"name": _ALL_JOINTS[mid], "pos_deg": round(pos_deg, 3),
-                                "pos_rad": round(_deg2rad(pos_deg), 5), "spd_rad_s": spd})
+                results.append({"name": _ALL_JOINTS[mid],
+                                "pos_rad": round(pos_rad, 5), "spd_rad_s": spd})
                 if clamped:
                     return {"ok": False, "code": "JOINT_LIMIT_VIOLATION",
-                            "message": f"leg joint {mid} ({_ALL_JOINTS[mid]}) target {target_deg:.1f}° out of range [{lim[0]}°, {lim[1]}°]"}
+                            "message": f"leg joint {mid} ({_ALL_JOINTS[mid]}) target {target_rad:.5f} rad out of range [{lo_rad:.5f}, {hi_rad:.5f}]"}
             self._pub_leg.publish(msg)
             return {"ok": True, "card": "waist", "action": "move_leg", "level": level,
                     "applied": results}
