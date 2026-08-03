@@ -1748,13 +1748,13 @@ class WaistPlugin:
         return {
             "name": "waist",
             "type": "actuator",
-            "description": "天轶2.0 腰部偏航+腿部升降 — yaw (-160°~180°), knee (-23°~20°), 俯仰角已禁用",
+            "description": "天轶2.0 腰部偏航+腿部升降 — yaw (-120°~120°), knee (-23°~20°), 俯仰角已禁用",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["move_yaw", "move_knee", "set_zero"],
                                "description": "控制模式"},
-                    "yaw": {"type": "number", "description": "腰偏航角(度), 范围[-160, 180], 默认0"},
+                    "yaw": {"type": "number", "description": "腰偏航角(度), 范围[-120, 120], 默认0"},
                     "knee": {"type": "number", "description": "膝关节俯仰角(度), 范围[-23, 20], 默认0"},
                     "target": {"type": "string", "enum": ["waist", "knee", "both"],
                                "description": "归零目标: waist=腰归零, knee=腿归零, both=同时归零"},
@@ -1763,7 +1763,7 @@ class WaistPlugin:
                 "required": ["action"],
                 "x-action-params": {
                     "move_yaw": {"params": ["yaw", "speed"],
-                                 "description": "腰部偏航: 控制yaw角度(度)"},
+                                 "description": "腰部偏航: 控制yaw角度(-120°~120°)"},
                     "move_knee": {"params": ["knee", "speed"],
                                   "description": "腿部升降: 控制knee角度(度)"},
                     "set_zero": {"params": ["target"],
