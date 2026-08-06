@@ -43,6 +43,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import String, Bool
+from std_srvs.srv import SetBool, Trigger
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -3044,3 +3045,178 @@ class LlmPlugin:
             "message": msg.message,
         })
         self._pub_event.publish(out)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SelfCheckPlugin (actuator) — 卡名: self_check
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SelfCheckPlugin:
+    """一键自检控制卡 — 无需遥控器，通过 ROS2 Service 触发自检。
+
+    接口：
+      - /external_node/start_operation (std_srvs/SetBool) → data:true 启动自检
+      - /external_node/get_status (std_srvs/Trigger)       → 查询自检结果
+
+    等效操作：遥控器 F 拨杆中间位 + 按 A 键自检 → 状态灯蓝绿常亮 = Ready
+    """
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._srv_node = Node("tianyi2_self_check", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._srv_node)
+        self._cli_start = None   # /external_node/start_operation
+        self._cli_status = None  # /external_node/get_status
+        self._srv_timeout = plugin_config.get("call_timeout", 5.0)
+        self._poll_interval = plugin_config.get("poll_interval", 2.0)
+        self._max_wait = plugin_config.get("max_wait", 90.0)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "self_check",
+            "type": "actuator",
+            "description": (
+                "天轶2.0 Pro 一键自检 — 无需遥控器。触发后自动轮询等待结果，"
+                "自检通过后状态灯蓝绿常亮，机器人进入 Ready 状态。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "status", "start_and_wait"],
+                        "description": (
+                            "start: 仅触发自检不等待; "
+                            "status: 仅查询当前自检结果; "
+                            "start_and_wait: 触发自检并轮询等待完成"
+                        ),
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "start": {
+                        "params": [],
+                        "description": "触发自检程序，不等待结果（等效遥控器按A键）",
+                    },
+                    "status": {
+                        "params": [],
+                        "description": "查询自检是否通过",
+                    },
+                    "start_and_wait": {
+                        "params": [],
+                        "description": "触发自检并轮询等待，直到自检完成或超时",
+                    },
+                },
+            },
+        }
+
+    def start(self):
+        """创建 Service 客户端（domain 0 与天轶本体通信）。"""
+        try:
+            self._cli_start = self._srv_node.create_client(
+                SetBool, "/external_node/start_operation")
+            self._cli_status = self._srv_node.create_client(
+                Trigger, "/external_node/get_status")
+            print("[SelfCheckPlugin] service clients created")
+        except Exception as e:
+            print(f"[SelfCheckPlugin] WARNING: service client creation failed: {e}")
+
+    def stop(self):
+        self._cli_start = None
+        self._cli_status = None
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "info"):
+            return {"state": "ready"}
+        elif action == "stop":
+            return {"state": "idle"}
+        elif action == "start":
+            return self._start_self_check()
+        elif action == "status":
+            return self._get_status()
+        elif action == "start_and_wait":
+            return self._start_and_wait()
+        return {"ok": False, "code": "INVALID_ARGUMENT",
+                "message": f"unknown action: {action}"}
+
+    # ── 内部实现 ────────────────────────────────────────────────────────────
+
+    def _start_self_check(self) -> dict:
+        """触发自检（不等待）。"""
+        if not self._cli_start:
+            return {"ok": False, "code": "PRECONDITION_FAILED",
+                    "message": "start_operation client not initialized"}
+        try:
+            if not self._cli_start.wait_for_service(timeout_sec=self._srv_timeout):
+                return {"ok": False, "code": "SERVICE_UNAVAILABLE",
+                        "message": "/external_node/start_operation 服务未就绪"}
+            req = SetBool.Request()
+            req.data = True
+            resp = self._cli_start.call(req)
+            return {
+                "ok": resp.success,
+                "code": 0,
+                "message": resp.message if resp.message else ("自检已触发，等待完成" if resp.success else "自检启动失败"),
+                "action": "start",
+            }
+        except Exception as e:
+            return {"ok": False, "code": "SERVICE_ERROR",
+                    "message": f"调用 start_operation 失败: {e}"}
+
+    def _get_status(self) -> dict:
+        """查询自检结果。"""
+        if not self._cli_status:
+            return {"ok": False, "code": "PRECONDITION_FAILED",
+                    "message": "get_status client not initialized"}
+        try:
+            if not self._cli_status.wait_for_service(timeout_sec=self._srv_timeout):
+                return {"ok": False, "code": "SERVICE_UNAVAILABLE",
+                        "message": "/external_node/get_status 服务未就绪"}
+            req = Trigger.Request()
+            resp = self._cli_status.call(req)
+            return {
+                "ok": resp.success,
+                "code": 0,
+                "message": resp.message if resp.message else ("自检通过，机器人 Ready ✅" if resp.success else "自检未通过或仍在进行中"),
+                "action": "status",
+            }
+        except Exception as e:
+            return {"ok": False, "code": "SERVICE_ERROR",
+                    "message": f"调用 get_status 失败: {e}"}
+
+    def _start_and_wait(self) -> dict:
+        """触发自检并轮询等待完成。"""
+        start_result = self._start_self_check()
+        if not start_result.get("ok"):
+            return start_result
+
+        t0 = time.time()
+        while time.time() - t0 < self._max_wait:
+            time.sleep(self._poll_interval)
+            status = self._get_status()
+            if status.get("ok"):
+                return {
+                    "ok": True,
+                    "code": 0,
+                    "message": status.get("message", "自检通过 ✅"),
+                    "elapsed_s": round(time.time() - t0, 1),
+                    "action": "start_and_wait",
+                }
+            msg = status.get("message", "")
+            if msg and "失败" in msg:
+                return {
+                    "ok": False,
+                    "code": "SELF_CHECK_FAILED",
+                    "message": msg,
+                    "elapsed_s": round(time.time() - t0, 1),
+                    "action": "start_and_wait",
+                }
+
+        return {
+            "ok": False,
+            "code": "TIMEOUT",
+            "message": f"自检超时（{self._max_wait}s），请检查硬件连接或查看状态灯",
+            "elapsed_s": round(time.time() - t0, 1),
+            "action": "start_and_wait",
+        }

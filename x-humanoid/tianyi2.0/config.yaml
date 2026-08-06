@@ -68,3 +68,8 @@ plugins:
     enabled: true
   llm:
     enabled: true
+  self_check:
+    enabled: true
+    call_timeout: 5.0
+    poll_interval: 2.0
+    max_wait: 90.0
