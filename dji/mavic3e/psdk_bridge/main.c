@@ -167,14 +167,68 @@ static T_DjiReturnCode _HalUart_ReadData(T_DjiUartHandle uartHandle,
 
 static T_DjiReturnCode _HalUart_GetStatus(E_DjiHalUartNum uartNum, T_DjiUartStatus *status) {
     (void)uartNum;
+    if (!status) return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
     status->isConnect = (s_uart_fd >= 0);
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
+/* Read a USB tty's VID/PID from sysfs.  The tty class path differs slightly
+ * between cdc_acm and ftdi_sio devices, so try both the interface parent and
+ * the USB device parent (the latter is needed for /dev/ttyUSB*). */
+static int _read_usb_id(const char *device, const char *attribute, uint16_t *id) {
+    char path[256];
+    char buf[32];
+    const char *dev_name;
+    const char *slash;
+    const char *path_formats[] = {
+        "/sys/class/tty/%s/device/../%s",
+        "/sys/class/tty/%s/device/../../%s",
+    };
+
+    if (!device || !attribute || !id) return -1;
+
+    slash = strrchr(device, '/');
+    dev_name = slash ? slash + 1 : device;
+
+    for (size_t i = 0; i < sizeof(path_formats) / sizeof(path_formats[0]); ++i) {
+        int n = snprintf(path, sizeof(path), path_formats[i], dev_name, attribute);
+        if (n < 0 || (size_t)n >= sizeof(path)) continue;
+
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+
+        if (fgets(buf, sizeof(buf), f)) {
+            char *end = NULL;
+            unsigned long value = strtoul(buf, &end, 16);
+            fclose(f);
+            if (end != buf && value <= 0xFFFFUL) {
+                *id = (uint16_t)value;
+                return 0;
+            }
+        } else {
+            fclose(f);
+        }
+    }
+
+    return -1;
+}
+
 static T_DjiReturnCode _HalUart_GetDeviceInfo(T_DjiHalUartDeviceInfo *deviceInfo) {
-    /* FTDI FT232R on E-Port dev board */
-    deviceInfo->vid = 0x0403;
-    deviceInfo->pid = 0x6001;
+    uint16_t vid = 0;
+    uint16_t pid = 0;
+
+    if (!deviceInfo) return DJI_ERROR_SYSTEM_MODULE_CODE_INVALID_PARAMETER;
+
+    if (_read_usb_id(s_uart_device, "idVendor", &vid) != 0 ||
+        _read_usb_id(s_uart_device, "idProduct", &pid) != 0) {
+        printf("[hal] unable to read USB VID/PID for %s\n", s_uart_device);
+        return DJI_ERROR_SYSTEM_MODULE_CODE_SYSTEM_ERROR;
+    }
+
+    deviceInfo->vid = vid;
+    deviceInfo->pid = pid;
+    printf("[hal] UART device info: %s VID=0x%04X PID=0x%04X\n",
+           s_uart_device, vid, pid);
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 

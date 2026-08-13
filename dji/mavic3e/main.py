@@ -270,13 +270,24 @@ _EPORT_USB_IDS = [
 
 def _detect_uart_device(timeout: int = 30) -> str | None:
     """Auto-detect E-Port serial device by scanning /dev/ttyUSB* and /dev/ttyACM*.
-    Matches by USB VID/PID whitelist from sysfs. Returns device path or None."""
+    Matches by USB VID/PID whitelist from sysfs. Prefer the FTDI UART exposed by
+    the E-Port adapter over the DJI USB CDC ACM control interface. Returns the
+    device path or None."""
     import glob
     import time as _t
 
     start = _t.time()
     while True:
-        candidates = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+        # Mavic 3E exposes two serial-looking devices when connected through
+        # the E-Port adapter:
+        #   ttyUSB*  -> FTDI E-Port UART (the PSDK transport)
+        #   ttyACM*  -> DJI USB CDC control interface
+        # Keep ttyUSB* first; sorting the combined list would select ttyACM0
+        # before ttyUSB0 and start PSDK on the wrong transport.
+        candidates = (
+            sorted(glob.glob("/dev/ttyUSB*"))
+            + sorted(glob.glob("/dev/ttyACM*"))
+        )
         for dev in candidates:
             vid, pid = _get_usb_ids(dev)
             if not vid:
