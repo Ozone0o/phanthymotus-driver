@@ -89,6 +89,7 @@ static void _signal_handler(int sig) {
 #include <termios.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 
 /* ── UART HAL implementation matching T_DjiHalUartHandler ─────────────── */
 
@@ -172,42 +173,55 @@ static T_DjiReturnCode _HalUart_GetStatus(E_DjiHalUartNum uartNum, T_DjiUartStat
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
-/* Read a USB tty's VID/PID from sysfs.  The tty class path differs slightly
- * between cdc_acm and ftdi_sio devices, so try both the interface parent and
- * the USB device parent (the latter is needed for /dev/ttyUSB*). */
+/* Read a USB tty's VID/PID from sysfs.  The tty class path differs between
+ * serial drivers and composite devices, so walk the resolved sysfs ancestry
+ * until the USB device descriptor is found. */
 static int _read_usb_id(const char *device, const char *attribute, uint16_t *id) {
-    char path[256];
+    char path[PATH_MAX];
+    char sysfs_path[PATH_MAX];
+    char sysfs_device[PATH_MAX];
+    char resolved_device[PATH_MAX];
     char buf[32];
     const char *dev_name;
-    const char *slash;
-    const char *path_formats[] = {
-        "/sys/class/tty/%s/device/../%s",
-        "/sys/class/tty/%s/device/../../%s",
-    };
 
     if (!device || !attribute || !id) return -1;
 
-    slash = strrchr(device, '/');
-    dev_name = slash ? slash + 1 : device;
+    if (realpath(device, resolved_device) != NULL) {
+        dev_name = strrchr(resolved_device, '/');
+        dev_name = dev_name ? dev_name + 1 : resolved_device;
+    } else {
+        dev_name = strrchr(device, '/');
+        dev_name = dev_name ? dev_name + 1 : device;
+    }
 
-    for (size_t i = 0; i < sizeof(path_formats) / sizeof(path_formats[0]); ++i) {
-        int n = snprintf(path, sizeof(path), path_formats[i], dev_name, attribute);
-        if (n < 0 || (size_t)n >= sizeof(path)) continue;
+    if (snprintf(sysfs_path, sizeof(sysfs_path),
+                 "/sys/class/tty/%s/device", dev_name) < 0 ||
+        realpath(sysfs_path, sysfs_device) == NULL) {
+        return -1;
+    }
+
+    for (int depth = 0; depth < 8; ++depth) {
+        int n = snprintf(path, sizeof(path), "%s/%s", sysfs_device, attribute);
+        if (n < 0 || (size_t)n >= sizeof(path)) return -1;
 
         FILE *f = fopen(path, "r");
-        if (!f) continue;
-
-        if (fgets(buf, sizeof(buf), f)) {
-            char *end = NULL;
-            unsigned long value = strtoul(buf, &end, 16);
-            fclose(f);
-            if (end != buf && value <= 0xFFFFUL) {
-                *id = (uint16_t)value;
-                return 0;
+        if (f) {
+            if (fgets(buf, sizeof(buf), f)) {
+                char *end = NULL;
+                unsigned long value = strtoul(buf, &end, 16);
+                fclose(f);
+                if (end != buf && value <= 0xFFFFUL) {
+                    *id = (uint16_t)value;
+                    return 0;
+                }
+            } else {
+                fclose(f);
             }
-        } else {
-            fclose(f);
         }
+
+        char *slash = strrchr(sysfs_device, '/');
+        if (!slash || slash == sysfs_device) break;
+        *slash = '\0';
     }
 
     return -1;

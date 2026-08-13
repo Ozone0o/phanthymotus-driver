@@ -259,61 +259,97 @@ def make_handler():
 
 # ── Device auto-detect (container startup) ────────────────────────────────
 
-# Known E-Port USB devices (VID, PID or None for any PID)
-_EPORT_USB_IDS = [
-    ("2ca3", None),    # DJI direct (any PID)
-    ("0403", "6001"),  # FTDI FT232R (E-Port dev board)
-    ("0403", "6010"),  # FTDI FT2232 (dual-port variant)
-    ("0403", "6014"),  # FTDI FT232H
-]
+# DJI exposes a CDC ACM control interface in addition to the UART exposed by an
+# external E-Port USB-UART adapter.  The adapter's VID/PID must not be used as
+# the identity of the E-Port: FTDI, CH340, CP210x, PL2303, and other adapters
+# are all valid as long as Linux exposes them as a USB serial device and the
+# PSDK handshake succeeds.
+_DJI_USB_VID = "2ca3"
 
 
-def _detect_uart_device(timeout: int = 30) -> str | None:
-    """Auto-detect E-Port serial device by scanning /dev/ttyUSB* and /dev/ttyACM*.
-    Matches by USB VID/PID whitelist from sysfs. Prefer the FTDI UART exposed by
-    the E-Port adapter over the DJI USB CDC ACM control interface. Returns the
-    device path or None."""
+def _describe_uart_device(device_path: str) -> dict:
+    """Return the USB identity and kernel driver for a serial device."""
+    vid, pid = _get_usb_ids(device_path)
+    return {
+        "path": device_path,
+        "vid": vid,
+        "pid": pid,
+        "driver": _get_usb_driver(device_path),
+    }
+
+
+def _enumerate_uart_devices() -> list[dict]:
+    """Enumerate USB-backed serial devices in E-Port probe order.
+
+    ttyUSB devices are preferred because the Mavic 3E commonly exposes its
+    own DJI CDC ACM control port at the same time.  Other USB serial devices,
+    including non-DJI ACM adapters, are tried next.  DJI ACM devices are kept
+    as the last fallback for direct-E-Port configurations.
+    """
     import glob
+
+    devices = sorted(set(
+        glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")
+    ))
+    candidates = []
+    for device_path in devices:
+        candidate = _describe_uart_device(device_path)
+        if not candidate["vid"] or not candidate["pid"]:
+            # Built-in UARTs and stale device nodes do not have USB identity;
+            # the C HAL cannot report a valid E-Port USB device for them.
+            continue
+        candidates.append(candidate)
+
+    def _probe_order(candidate: dict) -> tuple[int, str]:
+        path = candidate["path"]
+        if os.path.basename(path).startswith("ttyUSB"):
+            return 0, path
+        if candidate["vid"] != _DJI_USB_VID:
+            return 1, path
+        return 2, path
+
+    return sorted(candidates, key=_probe_order)
+
+
+def _detect_uart_devices(timeout: int = 30) -> list[dict]:
+    """Wait for at least one USB serial candidate and return all candidates."""
     import time as _t
 
     start = _t.time()
     while True:
-        # Mavic 3E exposes two serial-looking devices when connected through
-        # the E-Port adapter:
-        #   ttyUSB*  -> FTDI E-Port UART (the PSDK transport)
-        #   ttyACM*  -> DJI USB CDC control interface
-        # Keep ttyUSB* first; sorting the combined list would select ttyACM0
-        # before ttyUSB0 and start PSDK on the wrong transport.
-        candidates = (
-            sorted(glob.glob("/dev/ttyUSB*"))
-            + sorted(glob.glob("/dev/ttyACM*"))
-        )
-        for dev in candidates:
-            vid, pid = _get_usb_ids(dev)
-            if not vid:
-                continue
-            for known_vid, known_pid in _EPORT_USB_IDS:
-                if vid == known_vid and (known_pid is None or pid == known_pid):
-                    print(f"[bundle] E-Port detected: {dev} (VID={vid} PID={pid})")
-                    return dev
+        candidates = _enumerate_uart_devices()
+        if candidates:
+            summary = ", ".join(
+                f"{c['path']} (driver={c['driver'] or 'unknown'} "
+                f"VID={c['vid']} PID={c['pid']})"
+                for c in candidates
+            )
+            print(f"[bundle] USB serial candidates: {summary}")
+            return candidates
 
         elapsed = _t.time() - start
         if elapsed > timeout:
-            print(f"[bundle] WARNING: no E-Port device found after {timeout}s")
-            return None
+            print(f"[bundle] WARNING: no USB serial device found after {timeout}s")
+            return []
         if int(elapsed) % 5 == 0 and int(elapsed) > 0:
-            print(f"[bundle] waiting for E-Port device... ({int(elapsed)}s)")
+            print(f"[bundle] waiting for USB serial device... ({int(elapsed)}s)")
         _t.sleep(1)
 
 
 def _get_usb_ids(device_path: str) -> tuple[str, str]:
     """Read USB VID/PID from sysfs for a tty device."""
-    dev_name = os.path.basename(device_path)
-    # Try /sys/class/tty/<dev>/device/../idVendor
-    for base in [f"/sys/class/tty/{dev_name}/device/..",
-                 f"/sys/class/tty/{dev_name}/device/../.."]:
-        vid_path = f"{base}/idVendor"
-        pid_path = f"{base}/idProduct"
+    dev_name = os.path.basename(os.path.realpath(device_path))
+    sysfs_device = os.path.realpath(f"/sys/class/tty/{dev_name}/device")
+    if not os.path.exists(sysfs_device):
+        return "", ""
+
+    # Walk up the resolved sysfs tree.  The USB device descriptor is normally
+    # one level above the tty interface, but walking makes this work through
+    # composite adapters and USB hubs as well.
+    base = sysfs_device
+    for _ in range(8):
+        vid_path = os.path.join(base, "idVendor")
+        pid_path = os.path.join(base, "idProduct")
         try:
             with open(vid_path) as f:
                 vid = f.read().strip()
@@ -322,8 +358,108 @@ def _get_usb_ids(device_path: str) -> tuple[str, str]:
             if vid:
                 return vid, pid
         except (FileNotFoundError, PermissionError):
-            continue
+            pass
+        parent = os.path.dirname(base)
+        if parent == base:
+            break
+        base = parent
     return "", ""
+
+
+def _get_usb_driver(device_path: str) -> str:
+    """Read the kernel USB-serial driver name for a tty device."""
+    dev_name = os.path.basename(os.path.realpath(device_path))
+    driver_link = f"/sys/class/tty/{dev_name}/device/driver"
+    driver_path = os.path.realpath(driver_link)
+    if not os.path.exists(driver_path):
+        return ""
+    return os.path.basename(driver_path)
+
+
+def _stop_bridge_process(bridge_proc) -> None:
+    """Terminate a failed probe without leaving a child process behind."""
+    import subprocess as _sp
+
+    if bridge_proc is None or bridge_proc.poll() is not None:
+        return
+    bridge_proc.terminate()
+    try:
+        bridge_proc.wait(timeout=5)
+    except _sp.TimeoutExpired:
+        bridge_proc.kill()
+        bridge_proc.wait()
+
+
+def _start_psdk_bridge(bridge_bin: str, socket_path: str,
+                       psdk_cfg: dict, candidates: list[dict]):
+    """Probe candidates by running the real PSDK initialization on each one.
+
+    A serial device being present only proves that Linux enumerated an
+    adapter.  The bridge creates its IPC socket only after DjiCore_Init and
+    application startup succeed, so socket readiness is the protocol-level
+    E-Port selection signal.
+    """
+    import subprocess as _sp
+    import time as _t
+
+    probe_timeout = max(5, int(psdk_cfg.get("probe_timeout_s", 30)))
+    for index, candidate in enumerate(candidates, start=1):
+        detected_dev = candidate["path"]
+        try:
+            os.unlink(socket_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"[bundle] cannot remove stale bridge socket {socket_path}: {exc}")
+            continue
+
+        print(
+            f"[bundle] probing E-Port candidate {index}/{len(candidates)}: "
+            f"{detected_dev} (driver={candidate['driver'] or 'unknown'} "
+            f"VID={candidate['vid']} PID={candidate['pid']})"
+        )
+        bridge_proc = _sp.Popen(
+            [bridge_bin, socket_path,
+             psdk_cfg.get("app_id", ""),
+             psdk_cfg.get("app_key", ""),
+             psdk_cfg.get("app_license", ""),
+             detected_dev,
+             str(psdk_cfg.get("baud_rate", 921600))],
+            stdout=sys.stdout, stderr=sys.stderr,
+        )
+
+        ready = False
+        for _ in range(probe_timeout * 10):
+            if os.path.exists(socket_path):
+                ready = bridge_proc.poll() is None
+                break
+            return_code = bridge_proc.poll()
+            if return_code is not None:
+                print(
+                    f"[bundle] candidate {detected_dev} failed "
+                    f"(psdk_bridge exit={return_code})"
+                )
+                break
+            _t.sleep(0.1)
+
+        if ready:
+            print(f"[bundle] E-Port PSDK initialization succeeded on {detected_dev}")
+            return bridge_proc, detected_dev
+
+        if bridge_proc.poll() is None:
+            print(
+                f"[bundle] candidate {detected_dev} did not initialize "
+                f"within {probe_timeout}s"
+            )
+        _stop_bridge_process(bridge_proc)
+        try:
+            os.unlink(socket_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    return None, None
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -374,27 +510,10 @@ def main():
     mcp_port = int(cfg.get("mcp_port", 15702))
     psdk_cfg = cfg.get("psdk_bridge", {})
 
-    # Auto-detect UART device
+    # Resolve the bridge binary once; each candidate probe starts a fresh
+    # bridge process so a failed PSDK initialization cannot contaminate the
+    # next candidate.
     uart_dev = psdk_cfg.get("uart_dev", "auto")
-    detected_dev = None
-    if uart_dev == "auto":
-        detected_dev = _detect_uart_device(timeout=10)
-    elif os.path.exists(uart_dev):
-        detected_dev = uart_dev
-
-    # No device = don't start (avoid mock data misleading users)
-    if not detected_dev:
-        print(f"[bundle] ERROR: No E-Port device found. Driver will not start.")
-        print(f"[bundle] Connect E-Port dev board and restart container.")
-        # Keep process alive so container doesn't restart-loop, but don't serve
-        import time as _t
-        while True:
-            _t.sleep(60)
-
-    print(f"[bundle] namespace={namespace} mcp_port={mcp_port} uart={detected_dev}")
-
-    # Start psdk_bridge C process as subprocess
-    import subprocess as _sp
     bridge_bin = "/usr/local/bin/psdk_bridge"
     if not os.path.exists(bridge_bin):
         bridge_bin = "/work/psdk_bridge/build/psdk_bridge"
@@ -404,29 +523,28 @@ def main():
     # Container only checks if FFS endpoints are available — does NOT modify configfs.
     _configure_usb_gadget()
 
-    bridge_proc = _sp.Popen(
-        [bridge_bin, socket_path,
-         psdk_cfg.get("app_id", ""),
-         psdk_cfg.get("app_key", ""),
-         psdk_cfg.get("app_license", ""),
-         detected_dev,
-         str(psdk_cfg.get("baud_rate", 921600))],
-        stdout=sys.stdout, stderr=sys.stderr,
-    )
-    print(f"[bundle] psdk_bridge started (pid={bridge_proc.pid})")
-
-    # Wait for socket to appear (PSDK handshake takes 10-20s)
     import time as _t
-    for i in range(300):  # 30 seconds max
-        if os.path.exists(socket_path):
-            break
-        if i % 50 == 0 and i > 0:
-            print(f"[bundle] waiting for psdk_bridge socket... ({i//10}s)")
-        _t.sleep(0.1)
-    else:
-        print("[bundle] ERROR: psdk_bridge socket not ready after 30s, exiting")
-        bridge_proc.terminate()
-        sys.exit(1)
+    bridge_proc = None
+    detected_dev = None
+    while bridge_proc is None:
+        if uart_dev == "auto":
+            candidates = _detect_uart_devices(timeout=10)
+        elif os.path.exists(uart_dev):
+            candidates = [_describe_uart_device(uart_dev)]
+        else:
+            print(f"[bundle] configured UART device is not present: {uart_dev}")
+            candidates = []
+
+        if candidates:
+            bridge_proc, detected_dev = _start_psdk_bridge(
+                bridge_bin, socket_path, psdk_cfg, candidates)
+
+        if bridge_proc is None:
+            print("[bundle] no USB serial candidate completed PSDK initialization; retrying in 5s")
+            _t.sleep(5)
+
+    print(f"[bundle] namespace={namespace} mcp_port={mcp_port} uart={detected_dev}")
+    print(f"[bundle] psdk_bridge started (pid={bridge_proc.pid})")
 
     # Give bridge a moment to accept connections
     _t.sleep(1)

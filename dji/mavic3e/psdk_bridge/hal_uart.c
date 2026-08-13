@@ -10,6 +10,7 @@
 #include <sys/select.h>
 #include <sys/ioctl.h>
 #include <dirent.h>
+#include <limits.h>
 
 /* DJI USB Vendor ID */
 #define DJI_USB_VID 0x2CA3
@@ -44,37 +45,61 @@ static speed_t _baud_to_speed(uint32_t baud) {
 /* ── Auto-detect USB VID/PID from sysfs ─────────────────────────────── */
 
 static int _detect_vid_pid(const char *device) {
-    /*
-     * For /dev/ttyACMx, find the USB device in sysfs:
-     *   /sys/class/tty/ttyACM0/device/../idVendor
-     *   /sys/class/tty/ttyACM0/device/../idProduct
-     */
-    char path[256], buf[16];
-    const char *dev_name = strrchr(device, '/');
-    if (!dev_name) dev_name = device;
-    else dev_name++;
+    char path[PATH_MAX], sysfs_path[PATH_MAX], sysfs_device[PATH_MAX];
+    char resolved_device[PATH_MAX], buf[16];
+    const char *dev_name;
+    int got_vid = 0;
+    int got_pid = 0;
 
-    /* Try sysfs path */
-    snprintf(path, sizeof(path), "/sys/class/tty/%s/device/../idVendor", dev_name);
-    FILE *f = fopen(path, "r");
-    if (f) {
-        if (fgets(buf, sizeof(buf), f)) {
-            s_vid = (uint16_t)strtol(buf, NULL, 16);
-        }
-        fclose(f);
+    if (!device) return -1;
+
+    if (realpath(device, resolved_device) != NULL) {
+        dev_name = strrchr(resolved_device, '/');
+        dev_name = dev_name ? dev_name + 1 : resolved_device;
+    } else {
+        dev_name = strrchr(device, '/');
+        dev_name = dev_name ? dev_name + 1 : device;
     }
 
-    snprintf(path, sizeof(path), "/sys/class/tty/%s/device/../idProduct", dev_name);
-    f = fopen(path, "r");
-    if (f) {
-        if (fgets(buf, sizeof(buf), f)) {
-            s_pid = (uint16_t)strtol(buf, NULL, 16);
+    if (snprintf(sysfs_path, sizeof(sysfs_path),
+                 "/sys/class/tty/%s/device", dev_name) < 0 ||
+        realpath(sysfs_path, sysfs_device) == NULL) {
+        return -1;
+    }
+
+    for (int depth = 0; depth < 8; ++depth) {
+        int n = snprintf(path, sizeof(path), "%s/idVendor", sysfs_device);
+        if (n >= 0 && (size_t)n < sizeof(path)) {
+            FILE *f = fopen(path, "r");
+            if (f) {
+                if (fgets(buf, sizeof(buf), f)) {
+                    s_vid = (uint16_t)strtoul(buf, NULL, 16);
+                    got_vid = 1;
+                }
+                fclose(f);
+            }
         }
-        fclose(f);
+
+        n = snprintf(path, sizeof(path), "%s/idProduct", sysfs_device);
+        if (n >= 0 && (size_t)n < sizeof(path)) {
+            FILE *f = fopen(path, "r");
+            if (f) {
+                if (fgets(buf, sizeof(buf), f)) {
+                    s_pid = (uint16_t)strtoul(buf, NULL, 16);
+                    got_pid = 1;
+                }
+                fclose(f);
+            }
+        }
+
+        if (got_vid && got_pid) break;
+        char *slash = strrchr(sysfs_device, '/');
+        if (!slash || slash == sysfs_device) break;
+        *slash = '\0';
     }
 
     printf("[hal_uart] detected VID=0x%04X PID=0x%04X for %s\n", s_vid, s_pid, device);
-    return 0;
+    return (got_vid && got_pid) ? 0 : -1;
 }
 
 /* ── Public API ────────────────────────────────────────────────────── */
