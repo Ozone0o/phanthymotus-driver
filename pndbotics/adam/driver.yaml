@@ -1,0 +1,9 @@
+id: adam-driver
+name: PNDbotics Adam Pro Bundle
+category: driver
+hardware_provider: pndbotics
+hardware_model: "adam"
+image_name: pndbotics-adam
+port: 15709
+mcp_url: "http://localhost:15709/mcp"
+description: "PNDbotics Adam Pro — 31DOF 人形机器人 (gRPC 高层运控 + 状态感知 + 灵巧手)"

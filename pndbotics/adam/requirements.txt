@@ -1,0 +1,5 @@
+pyyaml
+numpy
+grpcio>=1.46.0
+protobuf>=3.20
+cyclonedds==0.10.2

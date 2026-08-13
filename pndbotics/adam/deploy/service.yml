@@ -1,0 +1,20 @@
+pndbotics-adam:
+  image: __IMAGE__
+  container_name: embodied-pndbotics-adam
+  network_mode: host
+  ipc: host
+  pid: host
+  privileged: true
+  environment:
+    - PYTHONUNBUFFERED=1
+    # adam_demo 的 gRPC 服务端运行在 NUC 运动控制电脑（10.10.20.127:6666）。
+    - GRPC_SERVER=10.10.20.127:6666
+    # ROS2 重发布层（ros_bridge.py）与 Agent Core 同域（与 bumi/tianyi 一致）。
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - ROS_DOMAIN_ID=42
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped

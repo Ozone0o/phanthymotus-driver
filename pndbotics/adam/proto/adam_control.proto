@@ -1,0 +1,154 @@
+syntax = "proto3";
+package adam_control;
+
+// Define the service
+service RobotControl {
+  rpc SetMode (SetModeRequest) returns (SetModeResponse); // Set robot mode
+  rpc SetStandMotion (SetStandMotionRequest) returns (SetStandMotionResponse); // In Stand mode - execute predefined motion capture actions
+  rpc SetStandCarryBox (SetCarryBoxRequest) returns (SetCarryBoxResponse); // In Stand mode - execute box-carrying actions
+  rpc SetStandAction (SetActionRequest) returns (SetActionResponse); // In Stand mode - execute posture control and squat height control
+  rpc SetStandDynamic (SetDynamicStandRequest) returns (SetDynamicStandResponse); // In Stand mode - adjust dynamic balance
+
+  rpc SetSpeed (SetSpeedRequest) returns (SetSpeedResponse); // In Walk and Run modes - set speed
+  rpc AutoUnigaitCOM (SetUnigaitCOMRequest) returns (SetUnigaitCOMResponse); // In Walk and Run modes - COM X-direction offset balance
+  rpc SetErrorClear (SetErrorClearRequest) returns (SetErrorClearResponse); // Error reset without restarting
+  rpc GetStandList (GetStandListRequest) returns (GetStandListResponse); // Get robot mode list
+  rpc GetRobotState (GetRobotStateRequest) returns (GetRobotStateResponse); // Get current executable state
+
+  rpc CloseProgram (CloseProgramRequest) returns (CloseProgramResponse); // Close the program
+}
+
+/*********************************************************************/
+/*********************************************************************/
+message SetModeRequest {
+    string mode = 1;
+}
+// Return control mode and state machine information
+message SetModeResponse {
+    bool success = 1;  // Whether the operation was successful
+    string message = 2;  // Response message
+}
+/*********************************************************************/
+// In Stand mode - execute motion capture actions
+message SetStandMotionRequest {
+    string motion = 1; // Fixed actions, four in total
+}
+message SetStandMotionResponse {
+    bool success = 1;  // Whether the operation was successful
+    string message = 2;  // Response message
+}
+/*********************************************************************/
+// In Stand mode - execute box-carrying actions
+message SetCarryBoxRequest {
+    string carry_box = 1; // 1:Squat to carry box 2:Stand to carry box 0:Place box
+}
+message SetCarryBoxResponse {
+    bool success = 1;  // Whether the operation was successful
+    string message = 2;  // Response message
+}
+/*********************************************************************/
+// In Stand mode - posture and height control
+message SetActionRequest {
+    double stand_pitch = 1;  // Pitch angle of the standing posture
+    double stand_roll = 2;  // Roll angle of the standing posture
+    double stand_yaw = 3;  // Yaw angle of the standing posture
+    double stand_height = 4;  // Standing height
+}
+message SetActionResponse {
+    bool success = 1;  // Whether the operation was successful
+    string message = 2;  // Response message
+}
+/*********************************************************************/
+// In Stand mode - self-recovery standing (switch to walking until stable and then stand)
+message SetDynamicStandRequest {
+    bool dynamic_stand = 1;  // Whether to enable dynamic standing
+}
+message SetDynamicStandResponse {
+    bool success = 1;  // Whether the operation was successful
+    string message = 2;  // Response message
+}
+/*********************************************************************/
+// In Unigait mode - set movement speed
+message SetSpeedRequest {
+    double x_speed = 1;  // X-direction speed
+    double y_speed = 2;  // Y-direction speed
+    double yaw_speed = 3;  // Yaw speed
+    bool continous = 4; // If true, keep sending data; otherwise, continue for 5s
+}
+message SetSpeedResponse {
+    bool success = 1;  // Whether the operation was successful
+    string message = 2;  // Response message
+}
+/*********************************************************************/
+// In Unigait mode - adjust COM offset
+message SetUnigaitCOMRequest {
+    bool unigait_mode_com_x = 1;  // Pressed is 1
+}
+message SetUnigaitCOMResponse {
+    bool success = 1;  // Whether the operation was successful
+    string message = 2;  // Response message
+}
+/*********************************************************************/
+// Error clearing
+message SetErrorClearRequest {
+    bool error_clear_flag = 1;
+}
+message SetErrorClearResponse {
+    bool success = 1;  // Whether the operation was successful
+    string message = 2;  // Response message
+}
+/*********************************************************************/
+// mode: fsm_name: 0:Start 1:Zero 2:Z2S 3:Stand 4:S2W 5:Walk 6:UniGait 7:Dual2Single 8:SingleStand 9:Single2Dual 10:Stop 11:Swing
+// Displayable: Start Zero Stand Walk Run SingleStand Stop
+/*********************************************************************/
+message GetStandListRequest {
+    bool mode_list_req = 1;  // String array, representing the mode list to be retrieved
+}
+message GetStandListResponse {
+    bool success = 1;  // Whether the operation was successful
+    string message = 2;  // Response message
+    repeated string mode_list = 3; // Mode list (Start Zero Stand Walk Run Stop)
+    repeated string motion_list = 4; // Motion list  (Greeting, Chest Expansion, Stretching, Gentleman's Salute)
+    repeated string action_list = 5; // Action list (Roll, Pitch, Yaw, Base Height)
+    repeated string carrybox_list = 6; // Box list (Squatting to Pick up the Box, Standing to Pick up the Box,Put Down the Box)
+    string balance_control = 7; // Dynamic balance (Dynamic Balance)
+}
+// motion: stand_motion(up&down, pitch&roll&yaw) box_motion(carry_box, place_box) arm_motion(motion1, motion2, motion3, ...)
+// balance_control: stand balance controller
+message GetRobotStateRequest {
+    bool get_state_flag = 1;
+}
+message GetRobotStateResponse {
+    bool success = 1;  // Whether the operation was successful
+    string message = 2;  // Response message
+    string fsm_name = 3;  // Current state machine name
+    string current_motion = 4; // Current single action being performed
+    repeated string current_action_list = 5; // Current posture set being performed
+
+    repeated string mode_enable_list = 6;  // Executable mode list
+    repeated string motion_enable_list = 7;  // Executable motion list
+    repeated string action_enable_list = 8;  // Executable posture list
+    repeated string carrybox_enable_list = 9; // Executable box-carrying list
+    string balance_control_enable = 10; // Executable dynamic balance
+
+    double stand_pitch = 11;  // Pitch angle
+    double stand_roll = 12;  // Roll angle
+    double stand_yaw = 13;  // Yaw angle
+    double stand_height = 14;  // Standing height
+
+    double x_vel = 15; // X velocity
+    double y_vel = 16; // Y velocity
+    double yaw_vel = 17; // Yaw velocity
+    bool balance_control_state = 18; // Whether currently in dynamic balance mode
+
+    bool motion_files_enable = 19; // Whether motion files are enabled
+}
+/*********************************************************************/
+message CloseProgramRequest {
+    bool close_flag = 1;
+}
+message CloseProgramResponse {
+    bool success = 1;  // Whether the operation was successful
+    string message = 2;  // Response message
+}
+/*********************************************************************/
