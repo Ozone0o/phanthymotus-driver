@@ -690,37 +690,64 @@ class HandPlugin:
 
 
 # ---------------------------------------------------------------------------
-# Direct body command controller for arm card
+# Direct body command controller
 # ---------------------------------------------------------------------------
 
-class _ArmDdsController:
+class _LowCmdStream:
+    """Single owner of the periodic ``rt/lowcmd`` publisher.
+
+    The lowcmd-backed cards (``arm``, ``lowcmd``, ``ankle_mode``) all write
+    per-joint command fields and the ankle mode into this shared stream; it
+    composes and publishes ``LowCmd_`` at a fixed rate. Sharing one publisher
+    guarantees the cards never fight over the ``rt/lowcmd`` topic.
+
+    Per-joint ``q`` targets are optional: ``None`` means "hold the latest
+    ``rt/lowstate`` position", so enabling the stream is safe mid-motion.
+    ``kp``/``kd`` are also optional and fall back to the variant gain profile.
+    """
+
     def __init__(self, variant: str, rate_hz: float, lowstate_sub=None, lowcmd_pub=None):
-        self._variant = variant
         self._joints = VARIANT_JOINTS[variant]
         self._dof = VARIANT_DOF[variant]
         self._joint_index = {name: index for index, name in enumerate(self._joints)}
-        self._control_indices = {
-            name: index for name, index in self._joint_index.items()
-            if name in ARM_JOINT_NAMES
-        }
-        self._kp, self._kd = _gain_profile(variant)
+        self._default_kp, self._default_kd = _gain_profile(variant)
         self._rate_hz = float(rate_hz)
         self._lowstate_sub = lowstate_sub
         self._lowcmd_pub = lowcmd_pub
+
+        # Full per-joint MotorCmd_ command state (all DOF).
+        self._mode = [1] * self._dof      # 1=enable, 0=disable
+        self._q = [None] * self._dof      # None -> hold latest lowstate position
+        self._dq = [0.0] * self._dof
+        self._tau = [0.0] * self._dof
+        self._kp = [None] * self._dof     # None -> default gain profile
+        self._kd = [None] * self._dof
+        self._ki = [0.0] * self._dof
+        self._mode_pr = 0                 # 0=PR (pitch/roll), 1=AB (parallel A/B)
+
         self._latest_state = None
-        self._target = {}
         self._active = False
+        self._started = False
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._state_thread = None
         self._command_thread = None
 
+    # -- lifecycle -----------------------------------------------------------
+
     def start(self):
-        if self._state_thread is None and self._lowstate_sub is not None:
-            self._state_thread = threading.Thread(target=self._poll_state, daemon=True, name="adam_arm_state")
+        if self._started:
+            return
+        self._started = True
+        if self._lowstate_sub is not None:
+            self._state_thread = threading.Thread(
+                target=self._poll_state, daemon=True, name="lowcmd_state"
+            )
             self._state_thread.start()
-        if self._command_thread is None and self._lowcmd_pub is not None:
-            self._command_thread = threading.Thread(target=self._publish_loop, daemon=True, name="adam_lowcmd")
+        if self._lowcmd_pub is not None:
+            self._command_thread = threading.Thread(
+                target=self._publish_loop, daemon=True, name="lowcmd_publish"
+            )
             self._command_thread.start()
 
     def stop(self):
@@ -730,35 +757,146 @@ class _ArmDdsController:
         for thread in (self._state_thread, self._command_thread):
             if thread is not None:
                 thread.join(timeout=1.5)
+        self._state_thread = None
+        self._command_thread = None
+        self._stop_event = threading.Event()
+        self._started = False
+
+    # -- lowstate feed (position hold) ----------------------------------------
 
     def _poll_state(self):
         while not self._stop_event.is_set():
             try:
-                state = self._lowstate_sub.Read(timeout=1)
-                if state is not None:
+                sample = self._lowstate_sub.Read(timeout=1)
+                if sample is not None:
                     with self._lock:
-                        self._latest_state = state
+                        self._latest_state = sample
             except Exception:
                 if not self._stop_event.is_set():
                     time.sleep(0.05)
 
-    def _make_command(self, state):
-        motors = list(getattr(state, "motor_state", []))
-        if len(motors) < self._dof or not HAS_PND_SDK:
-            return None
-        command = pnd_adam_msg_dds__LowCmd_(self._dof)
-        command.mode_pr = 0
+    # -- command mutation (used by cards) -------------------------------------
+
+    def set_active(self, active):
+        if active and self._lowcmd_pub is None:
+            return {"success": False, "message": "DDS rt/lowcmd publisher is unavailable"}
         with self._lock:
-            targets = dict(self._target)
-        for index, motor in enumerate(motors[:self._dof]):
+            self._active = bool(active)
+        return {"success": True, "state": "active" if active else "idle"}
+
+    def set_mode_pr(self, mode_pr):
+        if mode_pr not in (0, 1):
+            return {"success": False, "message": "mode_pr must be 0 (PR) or 1 (AB)"}
+        with self._lock:
+            self._mode_pr = mode_pr
+        return {"success": True, "mode_pr": mode_pr, "mode_name": "PR" if mode_pr == 0 else "AB"}
+
+    def set_joint_fields(self, updates):
+        """Set per-joint fields. ``updates``: {joint_name: {field: value}}.
+
+        Fields: q (rad), dq (rad/s), tau (Nm), kp, kd, ki, mode (0/1).
+        """
+        if not isinstance(updates, dict) or not updates:
+            return {"success": False, "message": "joints must be a non-empty mapping"}
+        unknown = []
+        applied = {}
+        numeric = ("q", "dq", "tau", "kp", "kd", "ki")
+        with self._lock:
+            for name, fields in updates.items():
+                index = self._joint_index.get(name)
+                if index is None or not isinstance(fields, dict):
+                    unknown.append(name)
+                    continue
+                per = {}
+                for field, value in fields.items():
+                    try:
+                        if field in numeric:
+                            number = float(value)
+                            if not math.isfinite(number):
+                                unknown.append(f"{name}.{field}")
+                                continue
+                        if field == "q":
+                            self._q[index] = number
+                        elif field == "dq":
+                            self._dq[index] = number
+                        elif field == "tau":
+                            self._tau[index] = number
+                        elif field == "kp":
+                            self._kp[index] = number
+                        elif field == "kd":
+                            self._kd[index] = number
+                        elif field == "ki":
+                            self._ki[index] = number
+                        elif field == "mode":
+                            self._mode[index] = 1 if int(value) != 0 else 0
+                        else:
+                            unknown.append(f"{name}.{field}")
+                            continue
+                        per[field] = value
+                    except (TypeError, ValueError):
+                        unknown.append(f"{name}.{field}")
+                        continue
+                if per:
+                    applied[name] = per
+        if not applied:
+            return {"success": False, "message": "No valid joint fields", "unknown": unknown}
+        return {"success": True, "joints_set": len(applied), "joints": applied,
+                "unknown": unknown or None}
+
+    def zero(self, names=None):
+        with self._lock:
+            targets = names if names is not None else self._joint_index
+            zeroed = []
+            for name in targets:
+                index = self._joint_index.get(name)
+                if index is not None:
+                    self._q[index] = 0.0
+                    self._dq[index] = 0.0
+                    self._tau[index] = 0.0
+                    zeroed.append(name)
+        return {"success": True, "joints_zeroed": len(zeroed)}
+
+    def info(self):
+        with self._lock:
+            return {
+                "state": "active" if self._active else "idle",
+                "state_received": self._latest_state is not None,
+                "mode_pr": self._mode_pr,
+                "mode_name": "PR" if self._mode_pr == 0 else "AB",
+                "dof": self._dof,
+                "enabled_joints": [self._joints[i] for i in range(self._dof) if self._mode[i]],
+            }
+
+    # -- composition + publish ------------------------------------------------
+
+    def _make_command(self):
+        if self._lowcmd_pub is None or not HAS_PND_SDK:
+            return None
+        with self._lock:
+            state = self._latest_state
+            mode_pr = self._mode_pr
+            mode = list(self._mode)
+            q = list(self._q)
+            dq = list(self._dq)
+            tau = list(self._tau)
+            kp = list(self._kp)
+            kd = list(self._kd)
+            ki = list(self._ki)
+        motors = list(getattr(state, "motor_state", []))
+        command = pnd_adam_msg_dds__LowCmd_(self._dof)
+        command.mode_pr = mode_pr
+        for index in range(self._dof):
             output = command.motor_cmd[index]
-            output.mode = 1
-            output.q = float(targets.get(self._joints[index], motor.q))
-            output.dq = 0.0
-            output.tau = 0.0
-            output.kp = float(self._kp[index])
-            output.kd = float(self._kd[index])
-            output.ki = 0.0
+            output.mode = mode[index]
+            if q[index] is None:
+                output.q = float(motors[index].q) if index < len(motors) else 0.0
+            else:
+                output.q = q[index]
+            output.dq = dq[index]
+            output.tau = tau[index]
+            output.kp = kp[index] if kp[index] is not None else self._default_kp[index]
+            output.kd = kd[index] if kd[index] is not None else self._default_kd[index]
+            output.ki = ki[index]
             output.reserve = 0
         command.reserve = 0
         return command
@@ -769,9 +907,8 @@ class _ArmDdsController:
             started = time.monotonic()
             with self._lock:
                 active = self._active
-                state = self._latest_state
-            if active and state is not None and self._lowcmd_pub is not None:
-                command = self._make_command(state)
+            if active:
+                command = self._make_command()
                 if command is not None:
                     try:
                         self._lowcmd_pub.Write(command)
@@ -779,17 +916,28 @@ class _ArmDdsController:
                         pass
             self._stop_event.wait(max(0.0, interval - (time.monotonic() - started)))
 
+
+class _ArmDdsController:
+    """Upper-body subset of the shared _LowCmdStream (arm card facade)."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._control_indices = {
+            name: index for name, index in stream._joint_index.items()
+            if name in ARM_JOINT_NAMES
+        }
+
+    def start(self):
+        self._stream.start()
+
+    def stop(self):
+        self._stream.stop()
+
     def enable(self):
-        if self._lowcmd_pub is None:
-            return {"success": False, "message": "DDS rt/lowcmd publisher is unavailable"}
-        with self._lock:
-            self._active = True
-        return {"success": True, "state": "active", "message": "DDS lowcmd arm control enabled"}
+        return self._stream.set_active(True)
 
     def disable(self):
-        with self._lock:
-            self._active = False
-        return {"success": True, "state": "idle"}
+        return self._stream.set_active(False)
 
     def set_joints(self, values):
         if not isinstance(values, dict):
@@ -809,33 +957,24 @@ class _ArmDdsController:
             normalized[name] = number
         if unknown:
             return {"success": False, "message": "Unknown or non-arm joints", "unknown_joints": unknown}
-        with self._lock:
-            self._target.update(normalized)
-            self._active = True
-        return {"success": True, "state": "active", "joints_set": len(normalized), "joints": normalized}
+        result = self._stream.set_joint_fields({name: {"q": value} for name, value in normalized.items()})
+        result["state"] = "active"
+        return result
 
     def zero(self):
-        return self.set_joints({name: 0.0 for name in self._control_indices})
+        return self._stream.zero(list(self._control_indices))
 
     def info(self):
-        with self._lock:
-            return {
-                "state": "active" if self._active else "idle",
-                "state_received": self._latest_state is not None,
-                "controlled_joints": sorted(self._control_indices),
-            }
+        info = self._stream.info()
+        info["controlled_joints"] = sorted(self._control_indices)
+        return info
 
 
 class ArmPlugin:
     PREFIX = "arm"
 
-    def __init__(self, plugin_config, _namespace, _executor, variant, arm_lowstate_sub=None, lowcmd_pub=None, **_kwargs):
-        self._controller = _ArmDdsController(
-            variant,
-            float(plugin_config.get("control_rate_hz", 400)),
-            lowstate_sub=arm_lowstate_sub,
-            lowcmd_pub=lowcmd_pub,
-        )
+    def __init__(self, plugin_config, _namespace, _executor, lowcmd_stream=None, **_kwargs):
+        self._controller = _ArmDdsController(lowcmd_stream)
 
     def get_tool(self):
         return {
@@ -880,6 +1019,115 @@ class ArmPlugin:
             return self._controller.disable()
         if action == "info":
             return self._controller.info()
+        return None
+
+
+class LowCmdPlugin:
+    """Full-DOF low-level joint control through the shared rt/lowcmd stream."""
+
+    PREFIX = "lowcmd"
+
+    def __init__(self, plugin_config, _namespace, _executor, lowcmd_stream=None, **_kwargs):
+        self._stream = lowcmd_stream
+
+    def get_tool(self):
+        return {
+            "name": "lowcmd",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "Adam full-DOF low-level control via DDS rt/lowcmd: per-joint q/dq/tau/kp/kd/ki and motor enable. Use while the high-level robot is standing or in the low-level dev pipeline",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["enable", "disable", "set_joints", "zero", "info"]},
+                    "joints": {
+                        "type": "object",
+                        "description": "Joint name → field map. Fields: q (rad), dq (rad/s), tau (Nm), kp, kd, ki, mode (0/1). e.g. {\"hipPitch_Left\": {\"q\": 0.3, \"tau\": 0.0}, \"elbow_Left\": {\"mode\": 0}}",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "enable": {"params": [], "description": "Start periodic rt/lowcmd stream"},
+                    "disable": {"params": [], "description": "Stop publishing (release control)"},
+                    "set_joints": {"params": ["joints"], "description": "Set per-joint q/dq/tau/kp/kd/ki/mode"},
+                    "zero": {"params": [], "description": "Zero q/dq/tau for all joints (keeps gains)"},
+                    "info": {"params": [], "description": "Stream state, ankle mode_pr, enabled joints"},
+                },
+            },
+        }
+
+    def start(self):
+        if self._stream is not None:
+            self._stream.start()
+
+    def stop(self):
+        if self._stream is not None:
+            self._stream.stop()
+
+    def dispatch(self, action, args):
+        if self._stream is None:
+            return {"success": False, "message": "DDS rt/lowcmd stream is unavailable"}
+        if action == "enable":
+            return self._stream.set_active(True)
+        if action == "disable":
+            return self._stream.set_active(False)
+        if action == "set_joints":
+            return self._stream.set_joint_fields(args.get("joints", {}))
+        if action == "zero":
+            return self._stream.zero()
+        if action == "info":
+            return self._stream.info()
+        return None
+
+
+class AnkleModePlugin:
+    """Switch ankle control mode PR (0) / AB (1) on the shared rt/lowcmd stream."""
+
+    PREFIX = "ankle_mode"
+    MODES = ["PR", "AB"]
+
+    def __init__(self, plugin_config, _namespace, _executor, lowcmd_stream=None, **_kwargs):
+        self._stream = lowcmd_stream
+
+    def get_tool(self):
+        return {
+            "name": "ankle_mode",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "Adam ankle control mode — PR (series pitch/roll) or AB (parallel virtual A/B joints), carried by LowCmd_.mode_pr on the rt/lowcmd stream",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["set", "get"]},
+                    "mode": {"type": "string", "enum": self.MODES, "description": "PR or AB"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "set": {"params": ["mode"], "description": "Switch ankle control mode"},
+                    "get": {"params": [], "description": "Read current ankle control mode"},
+                },
+            },
+        }
+
+    def start(self):
+        if self._stream is not None:
+            self._stream.start()
+
+    def stop(self):
+        if self._stream is not None:
+            self._stream.stop()
+
+    def dispatch(self, action, args):
+        if self._stream is None:
+            return {"success": False, "message": "DDS rt/lowcmd stream is unavailable"}
+        if action == "set":
+            mode = str(args.get("mode", "")).upper()
+            if mode not in self.MODES:
+                return {"success": False, "message": f"mode must be one of {self.MODES}"}
+            return self._stream.set_mode_pr(0 if mode == "PR" else 1)
+        if action == "get":
+            info = self._stream.info()
+            return {"success": True, "mode_pr": info["mode_pr"], "mode_name": info["mode_name"]}
         return None
 
 
@@ -1447,8 +1695,25 @@ class AdamDeviceBundle:
         if enabled("camera"):
             self._plugins.append(ZedCameraPlugin(
                 plugin_config.get("camera", {}), namespace, executor))
+        lowcmd_stream = None
+        if enabled("arm") or enabled("lowcmd") or enabled("ankle_mode"):
+            lowcmd_rate = float(
+                plugin_config.get("lowcmd", {}).get(
+                    "control_rate_hz",
+                    plugin_config.get("arm", {}).get("control_rate_hz", 400),
+                )
+            )
+            lowcmd_stream = _LowCmdStream(
+                variant, lowcmd_rate,
+                lowstate_sub=arm_lowstate_sub,
+                lowcmd_pub=lowcmd_pub,
+            )
         if enabled("arm"):
-            self._plugins.append(ArmPlugin(plugin_config.get("arm", {}), namespace, executor, variant, arm_lowstate_sub=arm_lowstate_sub, lowcmd_pub=lowcmd_pub))
+            self._plugins.append(ArmPlugin(plugin_config.get("arm", {}), namespace, executor, lowcmd_stream=lowcmd_stream))
+        if enabled("lowcmd"):
+            self._plugins.append(LowCmdPlugin(plugin_config.get("lowcmd", {}), namespace, executor, lowcmd_stream=lowcmd_stream))
+        if enabled("ankle_mode"):
+            self._plugins.append(AnkleModePlugin(plugin_config.get("ankle_mode", {}), namespace, executor, lowcmd_stream=lowcmd_stream))
         if enabled("hand_state"):
             self._plugins.append(HandStatePlugin(plugin_config.get("hand_state", {}), namespace, executor, handstate_sub=handstate_sub))
         if enabled("hand"):

@@ -47,6 +47,11 @@ plugins:
   arm:
     enabled: true
     control_rate_hz: 400
+  lowcmd:
+    enabled: true
+    control_rate_hz: 1000
+  ankle_mode:
+    enabled: true
   hand_state:
     enabled: true
     publish_rate_hz: 50
