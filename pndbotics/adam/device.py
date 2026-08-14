@@ -149,12 +149,10 @@ class _StatePublisherNode(Node):
         self.topic_imu = f"/{namespace}/state/imu"
         self.topic_battery = f"/{namespace}/state/battery"
         self.topic_motor_status = f"/{namespace}/state/motor_status"
-        self.topic_remote = f"/{namespace}/state/remote"
         self._skeleton_pub = self.create_publisher(String, self.topic_skeleton, qos)
         self._imu_pub = self.create_publisher(String, self.topic_imu, qos)
         self._battery_pub = self.create_publisher(String, self.topic_battery, qos)
         self._motor_status_pub = self.create_publisher(String, self.topic_motor_status, qos)
-        self._remote_pub = self.create_publisher(String, self.topic_remote, qos)
         self._state = None
         self._lock = threading.Lock()
         self.create_timer(1.0 / max(1.0, publish_rate_hz), self._publish)
@@ -224,18 +222,11 @@ class _StatePublisherNode(Node):
             },
         }
 
-        # Wireless remote (raw 19-channel float array)
-        wireless_remote = list(getattr(state, "wireless_remote", []))
-        remote_data = {
-            "channels": [float(v) for v in wireless_remote],
-        }
-
         for publisher, payload in (
             (self._skeleton_pub, skeleton),
             (self._imu_pub, imu_data),
             (self._battery_pub, battery_data),
             (self._motor_status_pub, motor_status_data),
-            (self._remote_pub, remote_data),
         ):
             message = String()
             message.data = json.dumps(payload)
@@ -281,12 +272,6 @@ class StatePlugin:
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self._node.topic_motor_status, "format": "data/json"}],
             },
-            {
-                "name": "remote", "type": "sensor", "multiInstance": False,
-                "description": "Adam wireless remote — raw 19-channel controller input",
-                "inputSchema": {"type": "object", "properties": {}},
-                "topic_out": [{"topic": self._node.topic_remote, "format": "data/json"}],
-            },
         ]
 
     def _poll(self):
@@ -321,7 +306,6 @@ class StatePlugin:
             "imu": (self._node.topic_imu, "data/json"),
             "battery": (self._node.topic_battery, "data/json"),
             "motor_status": (self._node.topic_motor_status, "data/json"),
-            "remote": (self._node.topic_remote, "data/json"),
         }
         if action == "start":
             self.start()
