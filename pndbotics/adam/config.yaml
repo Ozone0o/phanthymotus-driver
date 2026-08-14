@@ -50,7 +50,9 @@ plugins:
   arm:
     enabled: true
     control_rate_hz: 400
-  lowcmd:
+  leg:
+    enabled: true
+  joint_effort:
     enabled: true
     control_rate_hz: 1000
   ankle_mode:

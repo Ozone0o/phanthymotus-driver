@@ -166,6 +166,8 @@ def _make_dds_channels(config: dict):
         "arm_lowstate_sub": None,
         "handstate_sub": None,
         "lowcmd_pub": None,
+        "lowcmd_stream_pub": None,
+        "lowcmd_lowstate_sub": None,
         "hand_pub": None,
     }
     try:
@@ -196,6 +198,8 @@ def _make_dds_channels(config: dict):
         channels["arm_lowstate_sub"] = ChannelSubscriber("rt/lowstate", LowState_)
         channels["handstate_sub"] = ChannelSubscriber("rt/handstate", HandState_)
         channels["lowcmd_pub"] = ChannelPublisher("rt/lowcmd", LowCmd_)
+        channels["lowcmd_stream_pub"] = ChannelPublisher("rt/lowcmd", LowCmd_)
+        channels["lowcmd_lowstate_sub"] = ChannelSubscriber("rt/lowstate", LowState_)
         channels["hand_pub"] = ChannelPublisher("rt/handcmd", HandCmd_)
         for channel in channels.values():
             channel.Init()
