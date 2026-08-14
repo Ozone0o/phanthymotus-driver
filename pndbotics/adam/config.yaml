@@ -1,27 +1,38 @@
 mcp_port: 15702
 ros_namespace: ""  # auto-detect from hostname
 
-# Robot variant: "lite" (23 DOF), "sp" (29 DOF), "pro" (31 DOF)
+# Adam Pro exposes 31 body motors. Change to lite or sp for another model.
 variant: "pro"
 
-# gRPC endpoint for locomotion control
+# The official high-level RobotControl service listens on the robot at :6666.
 grpc_host: "localhost"
 grpc_port: 6666
 
-# DDS domain ID (must match robot's domain)
+# The Adam DDS service on the reference board uses domain 0. Leave the
+# interface empty to let CycloneDDS select the active robot interface.
 dds_domain_id: 0
+dds_network_interface: ""
 
 plugins:
   state:
     enabled: true
     publish_rate_hz: 50
+  robot_state:
+    enabled: true
+  switch_mode:
+    enabled: true
   loco:
     enabled: true
   arm:
     enabled: true
-    publish_rate_hz: 100
+    control_rate_hz: 400
+  hand_state:
+    enabled: true
+    publish_rate_hz: 50
   hand:
     enabled: true
-    hand_type: "pnd"  # "pnd" (0-1000) or "inspire" (0-1800)
+    # The connected board reports hand positions up to 1800 (Inspire hand).
+    hand_type: "inspire"
+    control_rate_hz: 400
   model:
     enabled: true

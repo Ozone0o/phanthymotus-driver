@@ -1,5 +1,4 @@
 syntax = "proto3";
-
 package adam_control;
 
 service RobotControl {
@@ -13,102 +12,121 @@ service RobotControl {
   rpc SetErrorClear (SetErrorClearRequest) returns (SetErrorClearResponse);
   rpc GetStandList (GetStandListRequest) returns (GetStandListResponse);
   rpc GetRobotState (GetRobotStateRequest) returns (GetRobotStateResponse);
+  rpc CloseProgram (CloseProgramRequest) returns (CloseProgramResponse);
 }
 
-// --- Mode ---
 message SetModeRequest {
-  int32 mode = 1;
+  string mode = 1;
 }
 message SetModeResponse {
-  int32 code = 1;
+  bool success = 1;
   string message = 2;
 }
 
-// --- Stand Motion (predefined pose) ---
 message SetStandMotionRequest {
-  int32 motion_id = 1;
+  string motion = 1;
 }
 message SetStandMotionResponse {
-  int32 code = 1;
+  bool success = 1;
   string message = 2;
 }
 
-// --- Carry Box ---
 message SetCarryBoxRequest {
-  bool enable = 1;
+  string carry_box = 1;
 }
 message SetCarryBoxResponse {
-  int32 code = 1;
+  bool success = 1;
   string message = 2;
 }
 
-// --- Stand Action (gesture/dance) ---
 message SetActionRequest {
-  int32 action_id = 1;
+  double stand_pitch = 1;
+  double stand_roll = 2;
+  double stand_yaw = 3;
+  double stand_height = 4;
 }
 message SetActionResponse {
-  int32 code = 1;
+  bool success = 1;
   string message = 2;
 }
 
-// --- Dynamic Stand ---
 message SetDynamicStandRequest {
-  float pitch = 1;
-  float roll = 2;
-  float yaw = 3;
-  float height = 4;
+  bool dynamic_stand = 1;
 }
 message SetDynamicStandResponse {
-  int32 code = 1;
+  bool success = 1;
   string message = 2;
 }
 
-// --- Speed (locomotion) ---
 message SetSpeedRequest {
-  float vx = 1;
-  float vy = 2;
-  float vyaw = 3;
+  double x_speed = 1;
+  double y_speed = 2;
+  double yaw_speed = 3;
+  bool continous = 4;
 }
 message SetSpeedResponse {
-  int32 code = 1;
+  bool success = 1;
   string message = 2;
 }
 
-// --- Unigait COM ---
 message SetUnigaitCOMRequest {
-  bool enable = 1;
+  bool unigait_mode_com_x = 1;
 }
 message SetUnigaitCOMResponse {
-  int32 code = 1;
+  bool success = 1;
   string message = 2;
 }
 
-// --- Error Clear ---
-message SetErrorClearRequest {}
+message SetErrorClearRequest {
+  bool error_clear_flag = 1;
+}
 message SetErrorClearResponse {
-  int32 code = 1;
+  bool success = 1;
   string message = 2;
 }
 
-// --- Get Stand List ---
-message GetStandListRequest {}
+message GetStandListRequest {
+  bool mode_list_req = 1;
+}
 message GetStandListResponse {
-  int32 code = 1;
+  bool success = 1;
   string message = 2;
-  repeated StandItem motions = 3;
-  repeated StandItem actions = 4;
-}
-message StandItem {
-  int32 id = 1;
-  string name = 2;
+  repeated string mode_list = 3;
+  repeated string motion_list = 4;
+  repeated string action_list = 5;
+  repeated string carrybox_list = 6;
+  string balance_control = 7;
 }
 
-// --- Get Robot State ---
-message GetRobotStateRequest {}
+message GetRobotStateRequest {
+  bool get_state_flag = 1;
+}
 message GetRobotStateResponse {
-  int32 code = 1;
+  bool success = 1;
   string message = 2;
-  int32 mode = 3;
-  int32 gait_state = 4;
-  float battery_percentage = 5;
+  string fsm_name = 3;
+  string current_motion = 4;
+  repeated string current_action_list = 5;
+  repeated string mode_enable_list = 6;
+  repeated string motion_enable_list = 7;
+  repeated string action_enable_list = 8;
+  repeated string carrybox_enable_list = 9;
+  string balance_control_enable = 10;
+  double stand_pitch = 11;
+  double stand_roll = 12;
+  double stand_yaw = 13;
+  double stand_height = 14;
+  double x_vel = 15;
+  double y_vel = 16;
+  double yaw_vel = 17;
+  bool balance_control_state = 18;
+  bool motion_files_enable = 19;
+}
+
+message CloseProgramRequest {
+  bool close_flag = 1;
+}
+message CloseProgramResponse {
+  bool success = 1;
+  string message = 2;
 }

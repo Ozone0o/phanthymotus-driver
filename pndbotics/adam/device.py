@@ -1,54 +1,57 @@
-"""PNPbotics Adam driver — plugin classes.
+"""PNDbotics Adam device plugins.
 
-Plugins:
-  StatePlugin  — DDS rt/lowstate + rt/handstate → ROS2 skeleton/IMU/battery
-  LocoPlugin   — gRPC locomotion control
-  ArmPlugin    — ROS2 JointState upper body control
-  HandPlugin   — DDS rt/handcmd finger control
-  ModelPlugin  — URDF resource for 3D visualization
+The public cards deliberately map to the interfaces documented by PNDbotics:
+
+* ``robot_state`` / ``switch_mode`` / ``loco`` use the official gRPC client;
+* ``hand_state`` / ``hand`` use ``rt/handstate`` and ``rt/handcmd``;
+* ``arm`` uses the documented periodic ``rt/lowcmd`` body command stream.
+
+The old implementation published arm commands to a generic ROS2
+``joint_states`` topic. Adam does not subscribe to that topic, so those
+commands could never reach a motor controller.
 """
 
+from __future__ import annotations
+
 import json
+import math
 import threading
 import time
 from pathlib import Path
 
-import numpy as np
-
 try:
-    import rclpy
     from rclpy.node import Node
-    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-    from sensor_msgs.msg import JointState
+    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
     from std_msgs.msg import String
 
     HAS_ROS2 = True
-except ImportError:
+except ImportError:  # Allows static/unit checks on a non-ROS development host.
     HAS_ROS2 = False
 
+    class Node:  # type: ignore[no-redef]
+        pass
+
+    class String:  # type: ignore[no-redef]
+        pass
+
 try:
-    from pndbotics_sdk_py.core.channel import (
-        ChannelFactoryInitialize,
-        ChannelPublisher,
-        ChannelSubscriber,
-    )
-    from pndbotics_sdk_py.idl.pnd_adam.msg.dds_ import (
-        LowState_,
-        LowCmd_,
-        HandCmd_,
-        HandState_,
-    )
+    from pndbotics_sdk_py.core.channel import ChannelPublisher, ChannelSubscriber
     from pndbotics_sdk_py.idl.default import (
         pnd_adam_msg_dds__HandCmd_,
+        pnd_adam_msg_dds__LowCmd_,
     )
 
     HAS_PND_SDK = True
 except ImportError:
     HAS_PND_SDK = False
+    ChannelPublisher = None  # type: ignore[assignment,misc]
+    ChannelSubscriber = None  # type: ignore[assignment,misc]
+    pnd_adam_msg_dds__HandCmd_ = None  # type: ignore[assignment]
+    pnd_adam_msg_dds__LowCmd_ = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
-# Joint definitions per variant
+# Adam joint order from the official body_joint_motor page.
 # ---------------------------------------------------------------------------
 
 ADAM_LITE_JOINTS = [
@@ -62,11 +65,7 @@ ADAM_LITE_JOINTS = [
 ]
 
 ADAM_SP_JOINTS = [
-    "hipPitch_Left", "hipRoll_Left", "hipYaw_Left",
-    "kneePitch_Left", "anklePitch_Left", "ankleRoll_Left",
-    "hipPitch_Right", "hipRoll_Right", "hipYaw_Right",
-    "kneePitch_Right", "anklePitch_Right", "ankleRoll_Right",
-    "waistRoll", "waistPitch", "waistYaw",
+    *ADAM_LITE_JOINTS[:15],
     "shoulderPitch_Left", "shoulderRoll_Left", "shoulderYaw_Left", "elbow_Left",
     "wristYaw_Left", "wristPitch_Left", "wristRoll_Left",
     "shoulderPitch_Right", "shoulderRoll_Right", "shoulderYaw_Right", "elbow_Right",
@@ -74,12 +73,7 @@ ADAM_SP_JOINTS = [
 ]
 
 ADAM_PRO_JOINTS = [
-    "hipPitch_Left", "hipRoll_Left", "hipYaw_Left",
-    "kneePitch_Left", "anklePitch_Left", "ankleRoll_Left",
-    "hipPitch_Right", "hipRoll_Right", "hipYaw_Right",
-    "kneePitch_Right", "anklePitch_Right", "ankleRoll_Right",
-    "waistRoll", "waistPitch", "waistYaw",
-    "neckYaw", "neckPitch",
+    *ADAM_LITE_JOINTS[:15], "neckYaw", "neckPitch",
     "shoulderPitch_Left", "shoulderRoll_Left", "shoulderYaw_Left", "elbow_Left",
     "wristYaw_Left", "wristPitch_Left", "wristRoll_Left",
     "shoulderPitch_Right", "shoulderRoll_Right", "shoulderYaw_Right", "elbow_Right",
@@ -91,666 +85,210 @@ VARIANT_JOINTS = {
     "sp": ADAM_SP_JOINTS,
     "pro": ADAM_PRO_JOINTS,
 }
+VARIANT_DOF = {name: len(joints) for name, joints in VARIANT_JOINTS.items()}
 
-VARIANT_DOF = {"lite": 23, "sp": 29, "pro": 31}
-
-# ROS2 JointState joint names for upper body control (used by ArmPlugin)
-ROS2_UPPER_BODY_JOINTS = [
-    "dof_pos/waistRoll", "dof_pos/waistPitch", "dof_pos/waistYaw",
-    "dof_pos/shoulderPitch_Left", "dof_pos/shoulderRoll_Left",
-    "dof_pos/shoulderYaw_Left", "dof_pos/elbow_Left",
-    "dof_pos/wristYaw_Left", "dof_pos/wristPitch_Left", "dof_pos/wristRoll_Left",
-    "dof_pos/shoulderPitch_Right", "dof_pos/shoulderRoll_Right",
-    "dof_pos/shoulderYaw_Right", "dof_pos/elbow_Right",
-    "dof_pos/wristYaw_Right", "dof_pos/wristPitch_Right", "dof_pos/wristRoll_Right",
-    "root_pos/z",
-    "dof_pos/hand_pinky_Left", "dof_pos/hand_ring_Left",
-    "dof_pos/hand_middle_Left", "dof_pos/hand_index_Left",
-    "dof_pos/hand_thumb_1_Left", "dof_pos/hand_thumb_2_Left",
-    "dof_pos/hand_pinky_Right", "dof_pos/hand_ring_Right",
-    "dof_pos/hand_middle_Right", "dof_pos/hand_index_Right",
-    "dof_pos/hand_thumb_1_Right", "dof_pos/hand_thumb_2_Right",
-]
+ARM_JOINT_NAMES = {
+    "waistRoll", "waistPitch", "waistYaw", "neckYaw", "neckPitch",
+    "shoulderPitch_Left", "shoulderRoll_Left", "shoulderYaw_Left", "elbow_Left",
+    "wristYaw_Left", "wristPitch_Left", "wristRoll_Left",
+    "shoulderPitch_Right", "shoulderRoll_Right", "shoulderYaw_Right", "elbow_Right",
+    "wristYaw_Right", "wristPitch_Right", "wristRoll_Right",
+}
 
 
-# ===========================================================================
-# StatePlugin — subscribes DDS rt/lowstate, publishes to ROS2
-# ===========================================================================
+def _gain_profile(variant: str):
+    """Conservative position gains matching the SDK's Adam Pro example."""
+    joints = VARIANT_JOINTS[variant]
+    kp = []
+    kd = []
+    for joint in joints:
+        if joint.startswith("hip") or joint.startswith("knee"):
+            kp.append(305.0 if joint.startswith("hipPitch") or joint.startswith("knee") else 405.0)
+            kd.append(6.1)
+        elif joint.startswith("ankle"):
+            kp.append(30.0)
+            kd.append(2.25)
+        elif joint.startswith("waist"):
+            kp.append(205.0 if joint == "waistRoll" else 405.0)
+            kd.append(4.1 if joint == "waistRoll" else 6.1)
+        elif joint.startswith("neck"):
+            kp.append(40.0)
+            kd.append(1.0)
+        elif joint.startswith("shoulderPitch"):
+            kp.append(18.0)
+            kd.append(0.9)
+        else:
+            kp.append(9.0)
+            kd.append(0.9)
+    return kp, kd
+
+
+def _best_effort_qos():
+    return QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+    )
+
+
+# ---------------------------------------------------------------------------
+# DDS state publishing
+# ---------------------------------------------------------------------------
 
 class _StatePublisherNode(Node):
-    """ROS2 node that publishes skeleton, IMU, and battery data."""
-
     def __init__(self, namespace: str, variant: str, publish_rate_hz: float):
         super().__init__("adam_state_publisher")
-        self._namespace = namespace
-        self._variant = variant
         self._joints = VARIANT_JOINTS[variant]
-
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
-
-        self._topic_skeleton = f"/{namespace}/state/joints"
-        self._topic_imu = f"/{namespace}/state/imu"
-        self._topic_battery = f"/{namespace}/state/battery"
-
-        self._pub_skeleton = self.create_publisher(String, self._topic_skeleton, qos)
-        self._pub_imu = self.create_publisher(String, self._topic_imu, qos)
-        self._pub_battery = self.create_publisher(String, self._topic_battery, qos)
-
-        self._latest_state = None
-        self._latest_hand = None
+        qos = _best_effort_qos()
+        self.topic_skeleton = f"/{namespace}/state/joints"
+        self.topic_imu = f"/{namespace}/state/imu"
+        self.topic_battery = f"/{namespace}/state/battery"
+        self._skeleton_pub = self.create_publisher(String, self.topic_skeleton, qos)
+        self._imu_pub = self.create_publisher(String, self.topic_imu, qos)
+        self._battery_pub = self.create_publisher(String, self.topic_battery, qos)
+        self._state = None
         self._lock = threading.Lock()
-
-        interval = 1.0 / publish_rate_hz
-        self._timer = self.create_timer(interval, self._publish)
+        self.create_timer(1.0 / max(1.0, publish_rate_hz), self._publish)
 
     def update_state(self, state):
         with self._lock:
-            self._latest_state = state
-
-    def update_hand(self, hand):
-        with self._lock:
-            self._latest_hand = hand
+            self._state = state
 
     def _publish(self):
         with self._lock:
-            state = self._latest_state
-            hand = self._latest_hand
-
+            state = self._state
         if state is None:
             return
 
-        # Skeleton (joints)
-        joints = []
-        for idx, name in enumerate(self._joints):
-            if idx < len(state.motor_state):
-                joints.append({
-                    "idx": idx,
-                    "name": name,
-                    "q": float(state.motor_state[idx].q),
-                })
-        msg = String()
-        msg.data = json.dumps({"joints": joints})
-        self._pub_skeleton.publish(msg)
-
-        # IMU
-        imu = state.imu_state
+        motors = list(getattr(state, "motor_state", []))
+        skeleton = {
+            "joints": [
+                {"idx": index, "name": name, "q": float(motors[index].q)}
+                for index, name in enumerate(self._joints)
+                if index < len(motors)
+            ]
+        }
+        imu = getattr(state, "imu_state", None)
         imu_data = {
-            "quaternion": list(imu.quaternion),
-            "gyroscope": list(imu.gyroscope),
-            "accelerometer": list(imu.accelerometer),
-            "ypr": list(imu.ypr),
-            "temperature": int(imu.temperature),
+            "quaternion": list(getattr(imu, "quaternion", [])),
+            "gyroscope": list(getattr(imu, "gyroscope", [])),
+            "accelerometer": list(getattr(imu, "accelerometer", [])),
+            "ypr": list(getattr(imu, "ypr", [])),
+            "temperature": int(getattr(imu, "temperature", 0)),
         }
-        msg_imu = String()
-        msg_imu.data = json.dumps(imu_data)
-        self._pub_imu.publish(msg_imu)
+        battery = getattr(state, "battery_data", None)
+        battery_data = {
+            "timestamp_ms": int(getattr(battery, "timestamp_ms", 0)),
+            "voltage": float(getattr(battery, "voltage", 0.0)),
+            "current": float(getattr(battery, "current", 0.0)),
+            "power": float(getattr(battery, "power", 0.0)),
+            "wh_accumulated": float(getattr(battery, "wh_accumulated", 0.0)),
+            "status": str(getattr(battery, "status", "")),
+        }
 
-        # Battery
-        bat = state.battery_data
-        bat_data = {
-            "voltage": float(bat.voltage),
-            "current": float(bat.current),
-            "power": float(bat.power),
-            "wh_accumulated": float(bat.wh_accumulated),
-            "status": str(bat.status) if hasattr(bat, "status") else "unknown",
-        }
-        msg_bat = String()
-        msg_bat.data = json.dumps(bat_data)
-        self._pub_battery.publish(msg_bat)
+        for publisher, payload in (
+            (self._skeleton_pub, skeleton),
+            (self._imu_pub, imu_data),
+            (self._battery_pub, battery_data),
+        ):
+            message = String()
+            message.data = json.dumps(payload)
+            publisher.publish(message)
 
 
 class StatePlugin:
-    """Subscribes DDS rt/lowstate and rt/handstate, publishes to ROS2."""
-
     PREFIX = "state"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor,
-                 variant: str, dds_lowstate_sub=None, dds_handstate_sub=None, **kwargs):
-        self._namespace = namespace
-        self._variant = variant
+    def __init__(self, plugin_config, namespace, executor, variant, lowstate_sub=None, **_kwargs):
         self._running = False
-
-        rate = plugin_config.get("publish_rate_hz", 50)
-        self._node = _StatePublisherNode(namespace, variant, rate)
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._lowstate_sub = lowstate_sub
+        self._node = _StatePublisherNode(
+            namespace, variant, float(plugin_config.get("publish_rate_hz", 50))
+        )
         executor.add_node(self._node)
 
-        # DDS subscribers (pre-created in main.py before rclpy.init to avoid conflict)
-        self._lowstate_sub = dds_lowstate_sub
-        self._handstate_sub = dds_handstate_sub
-
-        # Start polling thread for DDS data
-        if self._lowstate_sub or self._handstate_sub:
-            self._poll_thread = threading.Thread(target=self._poll_dds, daemon=True)
-            self._poll_thread.start()
-
-    def _poll_dds(self):
-        """Poll DDS subscribers in a background thread."""
-        while True:
-            if self._lowstate_sub:
-                try:
-                    msg = self._lowstate_sub.Read(timeout=1)
-                    if msg:
-                        self._node.update_state(msg)
-                except Exception:
-                    pass
-            if self._handstate_sub:
-                try:
-                    msg = self._handstate_sub.Read(timeout=0)
-                    if msg:
-                        self._node.update_hand(msg)
-                except Exception:
-                    pass
-
-    def get_tools(self) -> list:
+    def get_tools(self):
         return [
             {
-                "name": "joints",
-                "type": "sensor",
-                "description": "Adam joint state — real-time skeleton visualization",
+                "name": "joints", "type": "sensor", "multiInstance": False,
+                "description": "Adam body joint state from DDS rt/lowstate",
                 "inputSchema": {"type": "object", "properties": {}},
-                "topic_out": [
-                    {"topic": self._node._topic_skeleton, "format": "sensor/skeleton"}
-                ],
+                "topic_out": [{"topic": self._node.topic_skeleton, "format": "sensor/skeleton"}],
             },
             {
-                "name": "imu",
-                "type": "sensor",
-                "description": "Adam IMU — quaternion, gyroscope, accelerometer",
+                "name": "imu", "type": "sensor", "multiInstance": False,
+                "description": "Adam IMU from DDS rt/lowstate",
                 "inputSchema": {"type": "object", "properties": {}},
-                "topic_out": [
-                    {"topic": self._node._topic_imu, "format": "data/json"}
-                ],
+                "topic_out": [{"topic": self._node.topic_imu, "format": "data/json"}],
             },
             {
-                "name": "battery",
-                "type": "sensor",
-                "description": "Adam battery — voltage, current, power, status",
+                "name": "battery", "type": "sensor", "multiInstance": False,
+                "description": "Adam battery state from DDS rt/lowstate",
                 "inputSchema": {"type": "object", "properties": {}},
-                "topic_out": [
-                    {"topic": self._node._topic_battery, "format": "data/json"}
-                ],
+                "topic_out": [{"topic": self._node.topic_battery, "format": "data/json"}],
             },
         ]
 
+    def _poll(self):
+        while not self._stop_event.is_set():
+            if self._lowstate_sub is None:
+                self._stop_event.wait(1.0)
+                continue
+            try:
+                message = self._lowstate_sub.Read(timeout=1)
+                if message is not None:
+                    self._node.update_state(message)
+            except Exception:
+                # The SDK can raise while a reader is being closed during shutdown.
+                if not self._stop_event.is_set():
+                    time.sleep(0.05)
+
     def start(self):
         self._running = True
+        if self._thread is None and self._lowstate_sub is not None:
+            self._thread = threading.Thread(target=self._poll, daemon=True, name="adam_lowstate")
+            self._thread.start()
 
     def stop(self):
         self._running = False
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.5)
 
-    def dispatch(self, action: str, args: dict) -> dict:
+    def dispatch(self, action, args):
+        topics = {
+            "joints": (self._node.topic_skeleton, "sensor/skeleton"),
+            "imu": (self._node.topic_imu, "data/json"),
+            "battery": (self._node.topic_battery, "data/json"),
+        }
         if action == "start":
-            self._running = True
+            self.start()
             return {"state": "running"}
         if action == "stop":
-            self._running = False
+            self.stop()
             return {"state": "idle"}
-        if action == "info":
-            tool_name = args.get("_tool_name", "joints")
-            if tool_name == "imu":
-                return {"state": "running" if self._running else "idle",
-                        "topic_out": [{"topic": self._node._topic_imu, "format": "data/json"}]}
-            if tool_name == "battery":
-                return {"state": "running" if self._running else "idle",
-                        "topic_out": [{"topic": self._node._topic_battery, "format": "data/json"}]}
-            return {"state": "running" if self._running else "idle",
-                    "topic_out": [{"topic": self._node._topic_skeleton, "format": "sensor/skeleton"}]}
-        return None
+        topic, fmt = topics.get(args.get("_tool_name", "joints"), topics["joints"])
+        return {"state": "running" if self._running else "idle", "topic_out": [{"topic": topic, "format": fmt}]}
 
 
-# ===========================================================================
-# LocoPlugin — gRPC locomotion control
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# gRPC cards
+# ---------------------------------------------------------------------------
 
-class LocoPlugin:
-    """High-level locomotion via gRPC on port 6666."""
+class RobotStatePlugin:
+    PREFIX = "robot_state"
 
-    PREFIX = "loco"
-
-    def __init__(self, plugin_config: dict, namespace: str, executor,
-                 grpc_client, **kwargs):
-        self._grpc = grpc_client
-        self._namespace = namespace
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "loco",
-            "type": "actuator",
-            "description": "Adam locomotion — walk, turn, stop, gestures, mode switching",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": [
-                            "set_mode", "move", "stop", "stand_motion",
-                            "stand_action", "stand_dynamic", "get_state",
-                            "list_actions", "clear_error", "carry_box",
-                        ],
-                    },
-                    "mode": {"type": "integer", "description": "Mode ID"},
-                    "vx": {"type": "number", "description": "Forward velocity (m/s)"},
-                    "vy": {"type": "number", "description": "Lateral velocity (m/s)"},
-                    "vyaw": {"type": "number", "description": "Yaw angular velocity (rad/s)"},
-                    "motion_id": {"type": "integer", "description": "Predefined motion ID"},
-                    "action_id": {"type": "integer", "description": "Predefined action/gesture ID"},
-                    "pitch": {"type": "number", "description": "Body pitch (rad)"},
-                    "roll": {"type": "number", "description": "Body roll (rad)"},
-                    "yaw": {"type": "number", "description": "Body yaw (rad)"},
-                    "height": {"type": "number", "description": "Body height (m)"},
-                    "enable": {"type": "boolean", "description": "Enable/disable flag"},
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "set_mode": {
-                        "params": ["mode"],
-                        "description": "Switch robot mode (e.g., stand, walk)",
-                    },
-                    "move": {
-                        "params": ["vx", "vy", "vyaw"],
-                        "description": "Walk with specified velocities",
-                    },
-                    "stop": {
-                        "params": [],
-                        "description": "Stop all movement",
-                    },
-                    "stand_motion": {
-                        "params": ["motion_id"],
-                        "description": "Execute predefined standing pose",
-                    },
-                    "stand_action": {
-                        "params": ["action_id"],
-                        "description": "Execute predefined gesture/action",
-                    },
-                    "stand_dynamic": {
-                        "params": ["pitch", "roll", "yaw", "height"],
-                        "description": "Adjust body orientation and height while standing",
-                    },
-                    "get_state": {
-                        "params": [],
-                        "description": "Query current robot state (mode, gait, battery)",
-                    },
-                    "list_actions": {
-                        "params": [],
-                        "description": "List available motions and actions",
-                    },
-                    "clear_error": {
-                        "params": [],
-                        "description": "Clear error state",
-                    },
-                    "carry_box": {
-                        "params": ["enable"],
-                        "description": "Enable/disable carry box mode",
-                    },
-                },
-            },
-        }
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def dispatch(self, action: str, args: dict) -> dict:
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "set_mode":
-            return self._grpc.set_mode(args.get("mode", 0))
-        if action == "move":
-            return self._grpc.set_speed(
-                args.get("vx", 0.0), args.get("vy", 0.0), args.get("vyaw", 0.0)
-            )
-        if action == "stop_move" or action == "stop":
-            return self._grpc.set_speed(0.0, 0.0, 0.0)
-        if action == "stand_motion":
-            return self._grpc.set_stand_motion(args.get("motion_id", 0))
-        if action == "stand_action":
-            return self._grpc.set_stand_action(args.get("action_id", 0))
-        if action == "stand_dynamic":
-            return self._grpc.set_stand_dynamic(
-                pitch=args.get("pitch", 0.0),
-                roll=args.get("roll", 0.0),
-                yaw=args.get("yaw", 0.0),
-                height=args.get("height", 0.0),
-            )
-        if action == "get_state":
-            return self._grpc.get_robot_state()
-        if action == "list_actions":
-            return self._grpc.get_stand_list()
-        if action == "clear_error":
-            return self._grpc.set_error_clear()
-        if action == "carry_box":
-            return self._grpc.set_carry_box(args.get("enable", False))
-        if action == "info":
-            return {"state": "ready"}
-        return None
-
-
-# ===========================================================================
-# ArmPlugin — ROS2 JointState upper body control
-# ===========================================================================
-
-class _ArmControlNode(Node):
-    """ROS2 node that publishes JointState at 100Hz for upper body control."""
-
-    def __init__(self, namespace: str, publish_rate_hz: float):
-        super().__init__("adam_arm_controller")
-        self._namespace = namespace
-
-        self._pub = self.create_publisher(JointState, "joint_states", 10)
-        self._joint_names = ROS2_UPPER_BODY_JOINTS
-        self._positions = np.zeros(len(self._joint_names), dtype=np.float64)
-        # Default height = 1.0m (standing), hands fully open = 1000
-        self._positions[17] = 1.0  # root_pos/z
-        self._positions[18:24] = 1000.0  # left hand fingers
-        self._positions[24:30] = 1000.0  # right hand fingers
-
-        self._active = False
-        self._lock = threading.Lock()
-
-        interval = 1.0 / publish_rate_hz
-        self._timer = self.create_timer(interval, self._publish)
-
-    def _publish(self):
-        if not self._active:
-            return
-        with self._lock:
-            positions = self._positions.copy()
-
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = self._joint_names
-        msg.position = positions.tolist()
-        msg.velocity = [0.0] * len(self._joint_names)
-        msg.effort = [0.0] * len(self._joint_names)
-        self._pub.publish(msg)
-
-    def set_joints(self, joints_dict: dict):
-        """Set joint positions by name. Keys are short names like 'shoulderPitch_Left'."""
-        with self._lock:
-            for name, value in joints_dict.items():
-                # Try to find matching joint
-                full_name = f"dof_pos/{name}"
-                if full_name in self._joint_names:
-                    idx = self._joint_names.index(full_name)
-                    self._positions[idx] = float(value)
-                elif name in self._joint_names:
-                    idx = self._joint_names.index(name)
-                    self._positions[idx] = float(value)
-
-    def set_height(self, z: float):
-        z = max(0.6, min(1.0, z))
-        with self._lock:
-            self._positions[17] = z
-
-    def zero_arms(self):
-        with self._lock:
-            self._positions[:17] = 0.0
-            self._positions[17] = 1.0  # keep standing height
-
-
-class ArmPlugin:
-    """Upper body control via ROS2 JointState publishing at 100Hz."""
-
-    PREFIX = "arm"
-
-    def __init__(self, plugin_config: dict, namespace: str, executor,
-                 grpc_client=None, **kwargs):
-        self._namespace = namespace
+    def __init__(self, _plugin_config, _namespace, _executor, grpc_client, **_kwargs):
         self._grpc = grpc_client
 
-        rate = plugin_config.get("publish_rate_hz", 100)
-        self._node = _ArmControlNode(namespace, rate)
-        executor.add_node(self._node)
-
-    def get_tool(self) -> dict:
+    def get_tool(self):
         return {
-            "name": "arm",
-            "type": "actuator",
-            "description": "Adam upper body — waist, arms, wrists via ROS2 JointState at 100Hz",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["enable", "disable", "set_joints", "set_height", "zero"],
-                    },
-                    "joints": {
-                        "type": "object",
-                        "description": "Joint name → radian value pairs (e.g., {\"shoulderPitch_Left\": 0.5})",
-                    },
-                    "height": {
-                        "type": "number",
-                        "description": "Body height 0.6-1.0m",
-                    },
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "enable": {
-                        "params": [],
-                        "description": "Activate upper body retarget mode (robot must be standing)",
-                    },
-                    "disable": {
-                        "params": [],
-                        "description": "Deactivate upper body retarget mode",
-                    },
-                    "set_joints": {
-                        "params": ["joints"],
-                        "description": "Set arm/waist joint angles in radians",
-                    },
-                    "set_height": {
-                        "params": ["height"],
-                        "description": "Set body height (0.6-1.0m)",
-                    },
-                    "zero": {
-                        "params": [],
-                        "description": "Reset all arm joints to zero (neutral position)",
-                    },
-                },
-            },
-        }
-
-    def start(self):
-        pass
-
-    def stop(self):
-        self._node._active = False
-
-    def dispatch(self, action: str, args: dict) -> dict:
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            self._node._active = False
-            return {"state": "idle"}
-        if action == "enable":
-            self._node._active = True
-            return {"state": "active", "message": "Upper body retarget mode enabled"}
-        if action == "disable":
-            self._node._active = False
-            return {"state": "idle", "message": "Upper body retarget mode disabled"}
-        if action == "set_joints":
-            joints = args.get("joints", {})
-            self._node.set_joints(joints)
-            return {"state": "active", "joints_set": len(joints)}
-        if action == "set_height":
-            h = args.get("height", 1.0)
-            self._node.set_height(h)
-            return {"state": "active", "height": h}
-        if action == "zero":
-            self._node.zero_arms()
-            return {"state": "active", "message": "Arms zeroed"}
-        if action == "info":
-            return {"state": "active" if self._node._active else "idle"}
-        return None
-
-
-# ===========================================================================
-# HandPlugin — DDS rt/handcmd finger control
-# ===========================================================================
-
-class HandPlugin:
-    """Finger control via DDS rt/handcmd (PND hand: 0-1000, Inspire: 0-1800)."""
-
-    PREFIX = "hand"
-
-    def __init__(self, plugin_config: dict, namespace: str, executor,
-                 dds_hand_pub=None, dds_hand_sub=None, **kwargs):
-        self._namespace = namespace
-        self._hand_type = plugin_config.get("hand_type", "pnd")
-        self._max_val = 1000 if self._hand_type == "pnd" else 1800
-
-        self._hand_pub = dds_hand_pub
-        self._hand_sub = dds_hand_sub
-        self._latest_hand_state = None
-        self._lock = threading.Lock()
-
-        # Poll hand state in background
-        if self._hand_sub:
-            threading.Thread(target=self._poll_hand, daemon=True).start()
-
-    def _poll_hand(self):
-        while True:
-            try:
-                msg = self._hand_sub.Read(timeout=1)
-                if msg:
-                    with self._lock:
-                        self._latest_hand_state = msg
-            except Exception:
-                pass
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "hand",
-            "type": "actuator",
-            "description": f"Adam hand control — per-finger position (0=closed, {self._max_val}=open)",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["open", "close", "set_fingers", "get_state"],
-                    },
-                    "left": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "6 values [pinky, ring, middle, index, thumb1, thumb2]",
-                    },
-                    "right": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "6 values [pinky, ring, middle, index, thumb1, thumb2]",
-                    },
-                },
-                "required": ["action"],
-                "x-action-params": {
-                    "open": {
-                        "params": [],
-                        "description": "Open all fingers fully",
-                    },
-                    "close": {
-                        "params": [],
-                        "description": "Close all fingers (make fist)",
-                    },
-                    "set_fingers": {
-                        "params": ["left", "right"],
-                        "description": "Set individual finger positions",
-                    },
-                    "get_state": {
-                        "params": [],
-                        "description": "Read current finger positions",
-                    },
-                },
-            },
-        }
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def _send_hand_cmd(self, positions: list):
-        if not HAS_PND_SDK or self._hand_pub is None:
-            return
-        cmd = pnd_adam_msg_dds__HandCmd_()
-        for i in range(min(12, len(positions))):
-            cmd.position[i] = int(max(0, min(self._max_val, positions[i])))
-        self._hand_pub.Write(cmd)
-
-    def dispatch(self, action: str, args: dict) -> dict:
-        if action == "start":
-            return {"state": "ready"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "open":
-            positions = [self._max_val] * 12
-            self._send_hand_cmd(positions)
-            return {"state": "done", "message": "All fingers opened"}
-        if action == "close":
-            positions = [0] * 12
-            self._send_hand_cmd(positions)
-            return {"state": "done", "message": "All fingers closed"}
-        if action == "set_fingers":
-            left = args.get("left", [self._max_val] * 6)
-            right = args.get("right", [self._max_val] * 6)
-            positions = list(left[:6]) + list(right[:6])
-            # Pad if incomplete
-            while len(positions) < 12:
-                positions.append(self._max_val)
-            self._send_hand_cmd(positions)
-            return {"state": "done", "left": left[:6], "right": right[:6]}
-        if action == "get_state":
-            with self._lock:
-                state = self._latest_hand_state
-            if state is None:
-                return {"state": "unknown", "message": "No hand state received yet"}
-            return {
-                "state": "ok",
-                "left": list(state.position[:6]),
-                "right": list(state.position[6:12]),
-            }
-        if action == "info":
-            return {"state": "ready"}
-        return None
-
-
-# ===========================================================================
-# ModelPlugin — URDF resource
-# ===========================================================================
-
-class ModelPlugin:
-    """Returns URDF for 3D skeleton visualization on dashboard."""
-
-    PREFIX = "model"
-
-    # Map variant to available URDF file (repo only has lite, sp, standard)
-    _VARIANT_URDF = {
-        "lite": "adam_lite.urdf",
-        "sp": "adam_sp.urdf",
-        "pro": "adam_pro.urdf",       # adam_standard used as fallback for pro
-        "standard": "adam_pro.urdf",  # adam_standard stored as adam_pro
-    }
-
-    def __init__(self, plugin_config: dict, namespace: str, executor,
-                 variant: str, **kwargs):
-        self._variant = variant
-        self._namespace = namespace
-        # Resolve URDF file path
-        urdf_name = self._VARIANT_URDF.get(variant, f"adam_{variant}.urdf")
-        self._urdf_path = Path(__file__).parent / "resource" / urdf_name
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "model",
-            "type": "resource",
-            "description": f"Adam {self._variant} URDF model for 3D visualization",
+            "name": "robot_state",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": "Adam high-level mode/state from RobotControl.GetRobotState; response fields follow the official proto",
             "inputSchema": {"type": "object", "properties": {}},
         }
 
@@ -760,111 +298,622 @@ class ModelPlugin:
     def stop(self):
         pass
 
-    def dispatch(self, action: str, args: dict) -> dict:
+    def dispatch(self, action, _args):
+        if action in ("robot_state", "get_state"):
+            return self._grpc.get_robot_state()
         if action == "start":
-            return {"state": "running"}
+            return {"state": "ready"}
         if action == "stop":
             return {"state": "idle"}
-        # Return URDF content
-        if self._urdf_path.exists():
-            return {"urdf": self._urdf_path.read_text()}
-        # Try any available URDF as fallback
-        resource_dir = Path(__file__).parent / "resource"
-        urdfs = list(resource_dir.glob("adam_*.urdf"))
-        if urdfs:
-            return {"urdf": urdfs[0].read_text(), "note": f"Fallback URDF ({urdfs[0].name})"}
-        return {"error": f"No URDF found for variant '{self._variant}'"}
+        return None
 
 
-# ===========================================================================
-# AdamDeviceBundle — aggregates all plugins
-# ===========================================================================
+class SwitchModePlugin:
+    PREFIX = "switch_mode"
+    OFFICIAL_MODES = ["Start", "Zero", "Stand", "Walk", "Run", "Stop"]
+
+    def __init__(self, _plugin_config, _namespace, _executor, grpc_client, **_kwargs):
+        self._grpc = grpc_client
+
+    def get_tool(self):
+        return {
+            "name": "switch_mode",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "Switch Adam's official high-level mode through RobotControl.SetMode",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": self.OFFICIAL_MODES,
+                        "description": "Mode must be one of the modes currently allowed by robot_state.mode_enable_list",
+                    }
+                },
+                "required": ["mode"],
+            },
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action in ("switch_mode", "set_mode"):
+            mode = args.get("mode")
+            if mode not in self.OFFICIAL_MODES:
+                return {"success": False, "message": f"Unsupported Adam mode: {mode!r}"}
+            return self._grpc.set_mode(mode)
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
+        return None
+
+
+class LocoPlugin:
+    PREFIX = "loco"
+
+    def __init__(self, _plugin_config, _namespace, _executor, grpc_client, **_kwargs):
+        self._grpc = grpc_client
+
+    def get_tool(self):
+        return {
+            "name": "loco",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "Adam locomotion through RobotControl.SetSpeed; switch to Walk or Run first",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["move", "stop_move"]},
+                    "vx": {"type": "number", "description": "Linear x speed (m/s)"},
+                    "vy": {"type": "number", "description": "Linear y speed (m/s)"},
+                    "vyaw": {"type": "number", "description": "Yaw speed (rad/s)"},
+                    "continuous": {"type": "boolean", "default": True, "description": "Keep sending the speed command"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "move": {"params": ["vx", "vy", "vyaw", "continuous"], "description": "Set linear and turning speed in Walk/Run mode"},
+                    "stop_move": {"params": [], "description": "Send zero speed through SetSpeed"},
+                },
+            },
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, args):
+        if action == "move":
+            return self._grpc.set_speed(
+                args.get("vx", 0.0), args.get("vy", 0.0), args.get("vyaw", 0.0),
+                args.get("continuous", True),
+            )
+        if action == "stop_move":
+            return self._grpc.set_speed(0.0, 0.0, 0.0, True)
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return self._grpc.set_speed(0.0, 0.0, 0.0, True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# DDS hand state and hand command cards
+# ---------------------------------------------------------------------------
+
+def _hand_payload(message):
+    positions = [int(value) for value in list(getattr(message, "position", []))[:12]]
+    positions += [0] * (12 - len(positions))
+    return {
+        "position": positions,
+        "reserve": int(getattr(message, "reserve", 0)),
+        "left": positions[:6],
+        "right": positions[6:12],
+    }
+
+
+class _HandStatePublisherNode(Node):
+    def __init__(self, namespace: str, publish_rate_hz: float):
+        super().__init__("adam_hand_state_publisher")
+        self.topic = f"/{namespace}/state/hand"
+        self._publisher = self.create_publisher(String, self.topic, _best_effort_qos())
+        self._state = None
+        self._lock = threading.Lock()
+        self.create_timer(1.0 / max(1.0, publish_rate_hz), self._publish)
+
+    def update_state(self, state):
+        with self._lock:
+            self._state = state
+
+    def snapshot(self):
+        with self._lock:
+            state = self._state
+        return None if state is None else _hand_payload(state)
+
+    def _publish(self):
+        payload = self.snapshot()
+        if payload is None:
+            return
+        message = String()
+        message.data = json.dumps(payload)
+        self._publisher.publish(message)
+
+
+class HandStatePlugin:
+    PREFIX = "hand_state"
+
+    def __init__(self, plugin_config, namespace, executor, handstate_sub=None, **_kwargs):
+        self._running = False
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._handstate_sub = handstate_sub
+        self._node = _HandStatePublisherNode(
+            namespace, float(plugin_config.get("publish_rate_hz", 50))
+        )
+        executor.add_node(self._node)
+
+    def get_tool(self):
+        return {
+            "name": "hand_state",
+            "type": "sensor",
+            "multiInstance": False,
+            "description": "Adam DDS rt/handstate — 12 finger positions: left[0:6], right[6:12]",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._node.topic, "format": "data/json"}],
+        }
+
+    def _poll(self):
+        while not self._stop_event.is_set():
+            if self._handstate_sub is None:
+                self._stop_event.wait(1.0)
+                continue
+            try:
+                message = self._handstate_sub.Read(timeout=1)
+                if message is not None:
+                    self._node.update_state(message)
+            except Exception:
+                if not self._stop_event.is_set():
+                    time.sleep(0.05)
+
+    def start(self):
+        self._running = True
+        if self._thread is None and self._handstate_sub is not None:
+            self._thread = threading.Thread(target=self._poll, daemon=True, name="adam_handstate")
+            self._thread.start()
+
+    def stop(self):
+        self._running = False
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.5)
+
+    def dispatch(self, action, _args):
+        if action in ("hand_state", "read"):
+            payload = self._node.snapshot()
+            if payload is None:
+                return {"state": "unknown", "message": "No rt/handstate sample received yet"}
+            return payload
+        if action == "info":
+            return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._node.topic, "format": "data/json"}]}
+        if action == "start":
+            self.start()
+            return {"state": "running"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        return None
+
+
+class HandPlugin:
+    PREFIX = "hand"
+
+    def __init__(self, plugin_config, _namespace, _executor, hand_pub=None, **_kwargs):
+        self._hand_type = str(plugin_config.get("hand_type", "inspire")).lower()
+        self._max_value = 1000 if self._hand_type == "pnd" else 1800
+        self._rate_hz = float(plugin_config.get("control_rate_hz", 400))
+        self._hand_pub = hand_pub
+        self._target = [self._max_value] * 12
+        self._active = False
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._command = pnd_adam_msg_dds__HandCmd_() if HAS_PND_SDK else None
+
+    def get_tool(self):
+        return {
+            "name": "hand",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": f"Adam hand control through DDS rt/handcmd (0=closed, {self._max_value}=open)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["open", "close", "set_fingers"]},
+                    "left": {"type": "array", "items": {"type": "integer"}, "minItems": 6, "maxItems": 6, "description": "[pinky, ring, middle, index, thumb, lateral]"},
+                    "right": {"type": "array", "items": {"type": "integer"}, "minItems": 6, "maxItems": 6, "description": "[pinky, ring, middle, index, thumb, lateral]"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "open": {"params": [], "description": "Open all 12 fingers"},
+                    "close": {"params": [], "description": "Close all 12 fingers"},
+                    "set_fingers": {"params": ["left", "right"], "description": "Set all 12 finger positions"},
+                },
+            },
+        }
+
+    def _write_once(self):
+        if self._hand_pub is None or self._command is None:
+            return False
+        with self._lock:
+            values = list(self._target)
+        for index, value in enumerate(values):
+            self._command.position[index] = int(value)
+        self._command.reserve = 0
+        try:
+            self._hand_pub.Write(self._command)
+            return True
+        except Exception:
+            return False
+
+    def _publish_loop(self):
+        interval = 1.0 / max(1.0, self._rate_hz)
+        while not self._stop_event.is_set():
+            started = time.monotonic()
+            with self._lock:
+                active = self._active
+            if active:
+                self._write_once()
+            self._stop_event.wait(max(0.0, interval - (time.monotonic() - started)))
+
+    def start(self):
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._publish_loop, daemon=True, name="adam_handcmd")
+            self._thread.start()
+
+    def stop(self):
+        with self._lock:
+            self._active = False
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.5)
+
+    def _set_target(self, values):
+        if self._hand_pub is None or self._command is None:
+            return {"success": False, "message": "DDS rt/handcmd publisher is unavailable"}
+        try:
+            normalized = [
+                max(0, min(self._max_value, int(round(float(value)))))
+                for value in values
+            ]
+        except (TypeError, ValueError):
+            return {"success": False, "message": "Finger positions must be numeric"}
+        if len(normalized) != 12:
+            return {"success": False, "message": "Exactly 12 finger positions are required"}
+        with self._lock:
+            self._target = normalized
+            self._active = True
+        self._write_once()
+        return {"success": True, "position": normalized, "left": normalized[:6], "right": normalized[6:]}
+
+    def dispatch(self, action, args):
+        if action == "open":
+            result = self._set_target([self._max_value] * 12)
+            result["message"] = "All fingers opened" if result.get("success") else result.get("message")
+            return result
+        if action == "close":
+            result = self._set_target([0] * 12)
+            result["message"] = "All fingers closed" if result.get("success") else result.get("message")
+            return result
+        if action == "set_fingers":
+            left = args.get("left")
+            right = args.get("right")
+            if not isinstance(left, list) or not isinstance(right, list):
+                return {"success": False, "message": "left and right must each be six-value arrays"}
+            return self._set_target(left[:6] + right[:6])
+        if action == "start":
+            self.start()
+            return {"state": "ready"}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle"}
+        if action == "info":
+            with self._lock:
+                active = self._active
+            return {"state": "active" if active else "idle", "hand_type": self._hand_type}
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Direct body command controller for arm card
+# ---------------------------------------------------------------------------
+
+class _ArmDdsController:
+    def __init__(self, variant: str, rate_hz: float, lowstate_sub=None, lowcmd_pub=None):
+        self._variant = variant
+        self._joints = VARIANT_JOINTS[variant]
+        self._dof = VARIANT_DOF[variant]
+        self._joint_index = {name: index for index, name in enumerate(self._joints)}
+        self._control_indices = {
+            name: index for name, index in self._joint_index.items()
+            if name in ARM_JOINT_NAMES
+        }
+        self._kp, self._kd = _gain_profile(variant)
+        self._rate_hz = float(rate_hz)
+        self._lowstate_sub = lowstate_sub
+        self._lowcmd_pub = lowcmd_pub
+        self._latest_state = None
+        self._target = {}
+        self._active = False
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._state_thread = None
+        self._command_thread = None
+
+    def start(self):
+        if self._state_thread is None and self._lowstate_sub is not None:
+            self._state_thread = threading.Thread(target=self._poll_state, daemon=True, name="adam_arm_state")
+            self._state_thread.start()
+        if self._command_thread is None and self._lowcmd_pub is not None:
+            self._command_thread = threading.Thread(target=self._publish_loop, daemon=True, name="adam_lowcmd")
+            self._command_thread.start()
+
+    def stop(self):
+        with self._lock:
+            self._active = False
+        self._stop_event.set()
+        for thread in (self._state_thread, self._command_thread):
+            if thread is not None:
+                thread.join(timeout=1.5)
+
+    def _poll_state(self):
+        while not self._stop_event.is_set():
+            try:
+                state = self._lowstate_sub.Read(timeout=1)
+                if state is not None:
+                    with self._lock:
+                        self._latest_state = state
+            except Exception:
+                if not self._stop_event.is_set():
+                    time.sleep(0.05)
+
+    def _make_command(self, state):
+        motors = list(getattr(state, "motor_state", []))
+        if len(motors) < self._dof or not HAS_PND_SDK:
+            return None
+        command = pnd_adam_msg_dds__LowCmd_(self._dof)
+        command.mode_pr = 0
+        with self._lock:
+            targets = dict(self._target)
+        for index, motor in enumerate(motors[:self._dof]):
+            output = command.motor_cmd[index]
+            output.mode = 1
+            output.q = float(targets.get(self._joints[index], motor.q))
+            output.dq = 0.0
+            output.tau = 0.0
+            output.kp = float(self._kp[index])
+            output.kd = float(self._kd[index])
+            output.ki = 0.0
+            output.reserve = 0
+        command.reserve = 0
+        return command
+
+    def _publish_loop(self):
+        interval = 1.0 / max(1.0, self._rate_hz)
+        while not self._stop_event.is_set():
+            started = time.monotonic()
+            with self._lock:
+                active = self._active
+                state = self._latest_state
+            if active and state is not None and self._lowcmd_pub is not None:
+                command = self._make_command(state)
+                if command is not None:
+                    try:
+                        self._lowcmd_pub.Write(command)
+                    except Exception:
+                        pass
+            self._stop_event.wait(max(0.0, interval - (time.monotonic() - started)))
+
+    def enable(self):
+        if self._lowcmd_pub is None:
+            return {"success": False, "message": "DDS rt/lowcmd publisher is unavailable"}
+        with self._lock:
+            self._active = True
+        return {"success": True, "state": "active", "message": "DDS lowcmd arm control enabled"}
+
+    def disable(self):
+        with self._lock:
+            self._active = False
+        return {"success": True, "state": "idle"}
+
+    def set_joints(self, values):
+        if not isinstance(values, dict):
+            return {"success": False, "message": "joints must be an object of joint name to radians"}
+        unknown = []
+        normalized = {}
+        for name, value in values.items():
+            if name not in self._control_indices:
+                unknown.append(name)
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return {"success": False, "message": f"Invalid angle for joint {name!r}"}
+            if not math.isfinite(number):
+                return {"success": False, "message": f"Non-finite angle for joint {name!r}"}
+            normalized[name] = number
+        if unknown:
+            return {"success": False, "message": "Unknown or non-arm joints", "unknown_joints": unknown}
+        with self._lock:
+            self._target.update(normalized)
+            self._active = True
+        return {"success": True, "state": "active", "joints_set": len(normalized), "joints": normalized}
+
+    def zero(self):
+        return self.set_joints({name: 0.0 for name in self._control_indices})
+
+    def info(self):
+        with self._lock:
+            return {
+                "state": "active" if self._active else "idle",
+                "state_received": self._latest_state is not None,
+                "controlled_joints": sorted(self._control_indices),
+            }
+
+
+class ArmPlugin:
+    PREFIX = "arm"
+
+    def __init__(self, plugin_config, _namespace, _executor, variant, arm_lowstate_sub=None, lowcmd_pub=None, **_kwargs):
+        self._controller = _ArmDdsController(
+            variant,
+            float(plugin_config.get("control_rate_hz", 400)),
+            lowstate_sub=arm_lowstate_sub,
+            lowcmd_pub=lowcmd_pub,
+        )
+
+    def get_tool(self):
+        return {
+            "name": "arm",
+            "type": "actuator",
+            "multiInstance": False,
+            "description": "Adam waist/arm/wrist control through periodic DDS rt/lowcmd; use while high-level robot is standing",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["enable", "disable", "set_joints", "zero"]},
+                    "joints": {"type": "object", "description": "Joint name to radian value, e.g. shoulderPitch_Left"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "enable": {"params": [], "description": "Enable periodic rt/lowcmd arm control"},
+                    "disable": {"params": [], "description": "Release arm lowcmd control"},
+                    "set_joints": {"params": ["joints"], "description": "Set one or more arm/waist joint targets in radians"},
+                    "zero": {"params": [], "description": "Set controlled upper-body joints to zero"},
+                },
+            },
+        }
+
+    def start(self):
+        self._controller.start()
+
+    def stop(self):
+        self._controller.stop()
+
+    def dispatch(self, action, args):
+        if action == "enable":
+            return self._controller.enable()
+        if action == "disable":
+            return self._controller.disable()
+        if action == "set_joints":
+            return self._controller.set_joints(args.get("joints", {}))
+        if action == "zero":
+            return self._controller.zero()
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return self._controller.disable()
+        if action == "info":
+            return self._controller.info()
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Resource card and bundle
+# ---------------------------------------------------------------------------
+
+class ModelPlugin:
+    PREFIX = "model"
+    URDFS = {"lite": "adam_lite.urdf", "sp": "adam_sp.urdf", "pro": "adam_pro.urdf"}
+
+    def __init__(self, _plugin_config, _namespace, _executor, variant, **_kwargs):
+        self._variant = variant
+        self._path = Path(__file__).parent / "resource" / self.URDFS.get(variant, "adam_pro.urdf")
+
+    def get_tool(self):
+        return {
+            "name": "model", "type": "resource", "multiInstance": False,
+            "description": f"Adam {self._variant} URDF model",
+            "inputSchema": {"type": "object", "properties": {}},
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, _args):
+        if action in ("start", "stop"):
+            return {"state": "running" if action == "start" else "idle"}
+        if self._path.exists():
+            return {"urdf": self._path.read_text(encoding="utf-8")}
+        return {"error": f"No URDF found for variant {self._variant!r}"}
+
 
 class AdamDeviceBundle:
-    """Loads and manages all Adam plugins based on config."""
-
-    def __init__(self, config: dict, namespace: str, executor, grpc_client,
-                 dds_lowstate_sub=None, dds_handstate_sub=None,
-                 dds_hand_pub=None, dds_hand_sub=None):
+    def __init__(
+        self, config, namespace, executor, grpc_client,
+        lowstate_sub=None, arm_lowstate_sub=None, handstate_sub=None,
+        lowcmd_pub=None, hand_pub=None,
+    ):
         self._plugins = []
-        self._tool_map = {}  # tool_name → plugin
+        self._tool_map = {}
+        variant = config.get("variant", "pro")
+        plugin_config = config.get("plugins", {})
 
-        variant = config.get("variant", "sp")
-        plugins_cfg = config.get("plugins", {})
+        def enabled(name):
+            return plugin_config.get(name, {}).get("enabled", True)
 
-        # StatePlugin
-        if plugins_cfg.get("state", {}).get("enabled", True):
-            p = StatePlugin(
-                plugins_cfg.get("state", {}), namespace, executor,
-                variant=variant,
-                dds_lowstate_sub=dds_lowstate_sub,
-                dds_handstate_sub=dds_handstate_sub,
-            )
-            self._plugins.append(p)
+        if enabled("state"):
+            self._plugins.append(StatePlugin(plugin_config.get("state", {}), namespace, executor, variant, lowstate_sub=lowstate_sub))
+        if enabled("robot_state"):
+            self._plugins.append(RobotStatePlugin(plugin_config.get("robot_state", {}), namespace, executor, grpc_client))
+        if enabled("switch_mode"):
+            self._plugins.append(SwitchModePlugin(plugin_config.get("switch_mode", {}), namespace, executor, grpc_client))
+        if enabled("loco"):
+            self._plugins.append(LocoPlugin(plugin_config.get("loco", {}), namespace, executor, grpc_client))
+        if enabled("arm"):
+            self._plugins.append(ArmPlugin(plugin_config.get("arm", {}), namespace, executor, variant, arm_lowstate_sub=arm_lowstate_sub, lowcmd_pub=lowcmd_pub))
+        if enabled("hand_state"):
+            self._plugins.append(HandStatePlugin(plugin_config.get("hand_state", {}), namespace, executor, handstate_sub=handstate_sub))
+        if enabled("hand"):
+            self._plugins.append(HandPlugin(plugin_config.get("hand", {}), namespace, executor, hand_pub=hand_pub))
+        if enabled("model"):
+            self._plugins.append(ModelPlugin(plugin_config.get("model", {}), namespace, executor, variant))
 
-        # LocoPlugin
-        if plugins_cfg.get("loco", {}).get("enabled", True):
-            p = LocoPlugin(
-                plugins_cfg.get("loco", {}), namespace, executor,
-                grpc_client=grpc_client,
-            )
-            self._plugins.append(p)
-
-        # ArmPlugin
-        if plugins_cfg.get("arm", {}).get("enabled", True):
-            p = ArmPlugin(
-                plugins_cfg.get("arm", {}), namespace, executor,
-                grpc_client=grpc_client,
-            )
-            self._plugins.append(p)
-
-        # HandPlugin
-        if plugins_cfg.get("hand", {}).get("enabled", True):
-            p = HandPlugin(plugins_cfg.get("hand", {}), namespace, executor,
-                           dds_hand_pub=dds_hand_pub, dds_hand_sub=dds_hand_sub)
-            self._plugins.append(p)
-
-        # ModelPlugin
-        if plugins_cfg.get("model", {}).get("enabled", True):
-            p = ModelPlugin(
-                plugins_cfg.get("model", {}), namespace, executor,
-                variant=variant,
-            )
-            self._plugins.append(p)
-
-        # Build tool map
         for plugin in self._plugins:
-            if hasattr(plugin, "get_tools"):
-                for tool in plugin.get_tools():
-                    self._tool_map[tool["name"]] = plugin
-            elif hasattr(plugin, "get_tool"):
-                tool = plugin.get_tool()
+            tools = plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()]
+            for tool in tools:
                 self._tool_map[tool["name"]] = plugin
 
     def start_all(self):
-        for p in self._plugins:
-            p.start()
+        for plugin in self._plugins:
+            plugin.start()
 
     def stop_all(self):
-        for p in self._plugins:
-            p.stop()
+        for plugin in reversed(self._plugins):
+            plugin.stop()
 
-    def get_all_tools(self) -> list:
+    def get_all_tools(self):
         tools = []
         for plugin in self._plugins:
-            if hasattr(plugin, "get_tools"):
-                tools.extend(plugin.get_tools())
-            elif hasattr(plugin, "get_tool"):
-                tools.append(plugin.get_tool())
+            tools.extend(plugin.get_tools() if hasattr(plugin, "get_tools") else [plugin.get_tool()])
         return tools
 
-    def dispatch(self, tool_name: str, args: dict) -> dict:
+    def dispatch(self, tool_name, args):
         plugin = self._tool_map.get(tool_name)
         if plugin is None:
             return {"error": f"Unknown tool: {tool_name}"}
-        action = args.pop("action", tool_name)
-        args["_tool_name"] = tool_name
-        result = plugin.dispatch(action, args)
+        call_args = dict(args or {})
+        action = call_args.pop("action", tool_name)
+        call_args["_tool_name"] = tool_name
+        result = plugin.dispatch(action, call_args)
         if result is None:
-            return {"error": f"Unknown action '{action}' for tool '{tool_name}'"}
+            return {"error": f"Unknown action {action!r} for tool {tool_name!r}"}
         return result

@@ -1,0 +1,9 @@
+id: pnpbotics-adam
+name: PNDbotics Adam Bundle
+category: driver
+hardware_provider: pndbotics
+hardware_model: "adam"
+image_name: pnpbotics/adam
+port: 15702
+mcp_url: "http://localhost:15702/mcp"
+description: "PNDbotics Adam — gRPC high-level state/mode/loco plus DDS body and hand cards"
