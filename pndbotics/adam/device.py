@@ -143,9 +143,13 @@ class _StatePublisherNode(Node):
         self.topic_skeleton = f"/{namespace}/state/joints"
         self.topic_imu = f"/{namespace}/state/imu"
         self.topic_battery = f"/{namespace}/state/battery"
+        self.topic_motor_status = f"/{namespace}/state/motor_status"
+        self.topic_remote = f"/{namespace}/state/remote"
         self._skeleton_pub = self.create_publisher(String, self.topic_skeleton, qos)
         self._imu_pub = self.create_publisher(String, self.topic_imu, qos)
         self._battery_pub = self.create_publisher(String, self.topic_battery, qos)
+        self._motor_status_pub = self.create_publisher(String, self.topic_motor_status, qos)
+        self._remote_pub = self.create_publisher(String, self.topic_remote, qos)
         self._state = None
         self._lock = threading.Lock()
         self.create_timer(1.0 / max(1.0, publish_rate_hz), self._publish)
@@ -186,10 +190,47 @@ class _StatePublisherNode(Node):
             "status": str(getattr(battery, "status", "")),
         }
 
+        # Motor status (per-joint mode & state)
+        motors = list(getattr(state, "motor_state", []))
+        motor_list = []
+        enabled = 0
+        errors = 0
+        for idx, name in enumerate(self._joints):
+            if idx < len(motors):
+                ms = motors[idx]
+                mode = int(getattr(ms, "mode", 0))
+                state_val = int(getattr(ms, "state", 0))
+                motor_list.append({
+                    "idx": idx,
+                    "name": name,
+                    "mode": mode,
+                    "state": state_val,
+                })
+                if mode != 0:
+                    enabled += 1
+                if state_val != 0:
+                    errors += 1
+        motor_status_data = {
+            "motors": motor_list,
+            "summary": {
+                "total": len(motor_list),
+                "enabled": enabled,
+                "error_count": errors,
+            },
+        }
+
+        # Wireless remote (raw 19-channel float array)
+        wireless_remote = list(getattr(state, "wireless_remote", []))
+        remote_data = {
+            "channels": [float(v) for v in wireless_remote],
+        }
+
         for publisher, payload in (
             (self._skeleton_pub, skeleton),
             (self._imu_pub, imu_data),
             (self._battery_pub, battery_data),
+            (self._motor_status_pub, motor_status_data),
+            (self._remote_pub, remote_data),
         ):
             message = String()
             message.data = json.dumps(payload)
@@ -229,6 +270,18 @@ class StatePlugin:
                 "inputSchema": {"type": "object", "properties": {}},
                 "topic_out": [{"topic": self._node.topic_battery, "format": "data/json"}],
             },
+            {
+                "name": "motor_status", "type": "sensor", "multiInstance": False,
+                "description": "Adam motor status — per-joint mode (enabled/disabled) and state/error code",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [{"topic": self._node.topic_motor_status, "format": "data/json"}],
+            },
+            {
+                "name": "remote", "type": "sensor", "multiInstance": False,
+                "description": "Adam wireless remote — raw 19-channel controller input",
+                "inputSchema": {"type": "object", "properties": {}},
+                "topic_out": [{"topic": self._node.topic_remote, "format": "data/json"}],
+            },
         ]
 
     def _poll(self):
@@ -262,6 +315,8 @@ class StatePlugin:
             "joints": (self._node.topic_skeleton, "sensor/skeleton"),
             "imu": (self._node.topic_imu, "data/json"),
             "battery": (self._node.topic_battery, "data/json"),
+            "motor_status": (self._node.topic_motor_status, "data/json"),
+            "remote": (self._node.topic_remote, "data/json"),
         }
         if action == "start":
             self.start()
