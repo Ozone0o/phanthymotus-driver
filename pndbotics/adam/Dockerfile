@@ -17,7 +17,8 @@ ENV PYTHONUNBUFFERED=1
 
 # The ZED SDK itself stays on the Jetson host (licensed, architecture-specific
 # files). deploy/service.yml mounts its libraries and pyzed extension at
-# runtime. Pillow is used only to encode the SDK's BGRA frame as JPEG.
+# runtime. The distro Pillow package is used only to encode the SDK's BGRA
+# frame as JPEG.
 ARG APT_MIRROR_HOST=ports.ubuntu.com
 RUN sed -i "s|mirrors.tencentyun.com|${APT_MIRROR_HOST}|g" /etc/apt/sources.list \
  && apt-get -o Acquire::AllowInsecureRepositories=true update \
@@ -29,10 +30,8 @@ RUN sed -i "s|mirrors.tencentyun.com|${APT_MIRROR_HOST}|g" /etc/apt/sources.list
       libx11-6 \
       libxext6 \
       libbsd0 \
+      python3-pil \
  && rm -rf /var/lib/apt/lists/*
-
-ARG PYPI_MIRROR=https://pypi.org/simple/
-RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} Pillow
 
 ENV PYTHONPATH=/work:/opt/pyzed
 ENV ZED_PYTHON_PATH=/opt/pyzed
