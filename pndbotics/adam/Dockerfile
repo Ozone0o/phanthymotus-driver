@@ -18,7 +18,9 @@ ENV PYTHONUNBUFFERED=1
 # The ZED SDK itself stays on the Jetson host (licensed, architecture-specific
 # files). deploy/service.yml mounts its libraries and pyzed extension at
 # runtime. Pillow is used only to encode the SDK's BGRA frame as JPEG.
-RUN apt-get -o Acquire::AllowInsecureRepositories=true update \
+ARG APT_MIRROR_HOST=ports.ubuntu.com
+RUN sed -i "s|mirrors.tencentyun.com|${APT_MIRROR_HOST}|g" /etc/apt/sources.list \
+ && apt-get -o Acquire::AllowInsecureRepositories=true update \
  && apt-get install -y --no-install-recommends --allow-unauthenticated \
       libturbojpeg0 \
       libusb-1.0-0 \
