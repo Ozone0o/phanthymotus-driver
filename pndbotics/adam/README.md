@@ -38,16 +38,10 @@ Cards:
 - `camera_pointcloud`: optional ZED Mini XYZ stream as `sensor/pointcloud`.
   It is disabled by default to avoid continuous GPU/bandwidth use and can be
   enabled in `config.yaml` or toggled with the card's `start`/`stop` action.
-  Its packed coordinates follow the 15678 frontend contract used by the
-  Tianyi point-cloud card: the decoded frame is `(right, up, backward)`, with
-  roll/pitch leveled from the ZED Mini IMU and a configurable floor offset.
 
 The head-mounted ZED Mini is installed upside down. `camera_flip: true` uses
 the ZED SDK's native camera-data flip so RGB, depth and point-cloud outputs
 remain aligned; set it to `false` only when the camera is physically upright.
-Point-cloud leveling is controlled by `pointcloud.gravity_align`; when the
-camera has no valid IMU sample, the driver falls back to the fixed optical
-frame conversion and continues publishing.
 
 The ZED Mini is a local USB device on the Jetson Orin. The deployment mounts
 the host's `/usr/local/zed` SDK and its aarch64 `pyzed` extension into the
