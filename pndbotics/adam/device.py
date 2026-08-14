@@ -107,6 +107,115 @@ LEG_JOINT_NAMES = {
     "anklePitch_Right", "ankleRoll_Right",
 }
 
+# Body-part groups driving the per-group set_<part> actions (arm / leg cards).
+ARM_GROUPS = {
+    "waist":    ["waistRoll", "waistPitch", "waistYaw"],
+    "neck":     ["neckYaw", "neckPitch"],
+    "shoulder": ["shoulderPitch_Left", "shoulderRoll_Left", "shoulderYaw_Left",
+                 "shoulderPitch_Right", "shoulderRoll_Right", "shoulderYaw_Right"],
+    "elbow":    ["elbow_Left", "elbow_Right"],
+    "wrist":    ["wristYaw_Left", "wristPitch_Left", "wristRoll_Left",
+                 "wristYaw_Right", "wristPitch_Right", "wristRoll_Right"],
+}
+LEG_GROUPS = {
+    "hip":   ["hipPitch_Left", "hipRoll_Left", "hipYaw_Left",
+              "hipPitch_Right", "hipRoll_Right", "hipYaw_Right"],
+    "knee":  ["kneePitch_Left", "kneePitch_Right"],
+    "ankle": ["anklePitch_Left", "ankleRoll_Left",
+              "anklePitch_Right", "ankleRoll_Right"],
+}
+GROUP_LABELS = {
+    "waist": "腰部", "neck": "颈部", "shoulder": "肩部", "elbow": "肘部", "wrist": "腕部",
+    "hip": "髋部", "knee": "膝部", "ankle": "踝部",
+}
+
+# Per-joint field label ("这个参数是控制什么的"), used in the set_<part> forms.
+JOINT_DESCRIPTIONS = {
+    "waistRoll": "腰部横滚(rad),身体左右倾斜",
+    "waistPitch": "腰部俯仰(rad),身体前后弯",
+    "waistYaw": "腰部偏航(rad),身体左右转",
+    "neckYaw": "颈部偏航(rad),左右转头",
+    "neckPitch": "颈部俯仰(rad),抬头低头",
+    "shoulderPitch_Left": "左肩俯仰(rad),左上臂前后摆",
+    "shoulderRoll_Left": "左肩横滚(rad),左上臂侧抬",
+    "shoulderYaw_Left": "左肩偏航(rad),左上臂旋转",
+    "elbow_Left": "左肘(rad),左小臂屈伸",
+    "wristYaw_Left": "左腕偏航(rad),左手腕旋转",
+    "wristPitch_Left": "左腕俯仰(rad),左手腕前后弯",
+    "wristRoll_Left": "左腕横滚(rad),左手腕左右弯",
+    "shoulderPitch_Right": "右肩俯仰(rad),右上臂前后摆",
+    "shoulderRoll_Right": "右肩横滚(rad),右上臂侧抬",
+    "shoulderYaw_Right": "右肩偏航(rad),右上臂旋转",
+    "elbow_Right": "右肘(rad),右小臂屈伸",
+    "wristYaw_Right": "右腕偏航(rad),右手腕旋转",
+    "wristPitch_Right": "右腕俯仰(rad),右手腕前后弯",
+    "wristRoll_Right": "右腕横滚(rad),右手腕左右弯",
+    "hipPitch_Left": "左髋俯仰(rad),左大腿前后摆",
+    "hipRoll_Left": "左髋横滚(rad),左大腿侧抬",
+    "hipYaw_Left": "左髋偏航(rad),左大腿旋转",
+    "kneePitch_Left": "左膝(rad),左小腿屈伸",
+    "anklePitch_Left": "左踝俯仰(rad),左脚掌前后倾",
+    "ankleRoll_Left": "左踝横滚(rad),左脚掌左右倾",
+    "hipPitch_Right": "右髋俯仰(rad),右大腿前后摆",
+    "hipRoll_Right": "右髋横滚(rad),右大腿侧抬",
+    "hipYaw_Right": "右髋偏航(rad),右大腿旋转",
+    "kneePitch_Right": "右膝(rad),右小腿屈伸",
+    "anklePitch_Right": "右踝俯仰(rad),右脚掌前后倾",
+    "ankleRoll_Right": "右踝横滚(rad),右脚掌左右倾",
+}
+
+# Mechanical joint limits (rad) from resource/adam_pro.urdf `<limit lower upper>`.
+# neckYaw / neckPitch / wristRoll_* are absent from the shipped URDF, so they
+# stay unbounded here until official numbers are available.
+JOINT_LIMITS = {
+    "hipPitch_Left": (-2.164, 2.164),
+    "hipRoll_Left": (-0.733, 1.605),
+    "hipYaw_Left": (-0.785, 0.785),
+    "kneePitch_Left": (0.052, 2.391),
+    "anklePitch_Left": (-1.0, 0.35),
+    "ankleRoll_Left": (-0.3491, 0.3491),
+    "hipPitch_Right": (-2.164, 2.164),
+    "hipRoll_Right": (-1.605, 0.733),
+    "hipYaw_Right": (-0.785, 0.785),
+    "kneePitch_Right": (0.052, 2.391),
+    "anklePitch_Right": (-1.0, 0.35),
+    "ankleRoll_Right": (-0.3491, 0.3491),
+    "waistRoll": (-0.226, 0.226),
+    "waistPitch": (-0.785, 1.308),
+    "waistYaw": (-0.78, 0.78),
+    "shoulderPitch_Left": (-3.560, 1.989),
+    "shoulderRoll_Left": (-0.575, 2.74),
+    "shoulderYaw_Left": (-1.6, 1.6),
+    "elbow_Left": (-2.0, 0.0),
+    "wristYaw_Left": (-2.617, 2.617),
+    "wristPitch_Left": (-0.907, 0.907),
+    "shoulderPitch_Right": (-3.560, 1.989),
+    "shoulderRoll_Right": (-2.74, 0.575),
+    "shoulderYaw_Right": (-1.6, 1.6),
+    "elbow_Right": (-2.0, 0.0),
+    "wristYaw_Right": (-2.617, 2.617),
+    "wristPitch_Right": (-0.907, 0.907),
+}
+
+
+def _joint_property(name: str):
+    """Number-field JSON schema for a joint, with URDF mechanical bounds."""
+    prop = {"type": "number", "description": JOINT_DESCRIPTIONS.get(name, name)}
+    limit = JOINT_LIMITS.get(name)
+    if limit:
+        prop["minimum"], prop["maximum"] = limit
+    return prop
+
+
+def _range_errors(values: dict) -> dict:
+    """Return {joint: {minimum, maximum}} for position targets outside JOINT_LIMITS."""
+    errors = {}
+    for name, value in values.items():
+        limit = JOINT_LIMITS.get(name)
+        if limit is not None and not (limit[0] <= float(value) <= limit[1]):
+            errors[name] = {"minimum": limit[0], "maximum": limit[1]}
+    return errors
+
 
 def _gain_profile(variant: str):
     """Conservative position gains matching the SDK's Adam Pro example."""
@@ -807,6 +916,10 @@ class _LowCmdStream:
                                 unknown.append(f"{name}.{field}")
                                 continue
                         if field == "q":
+                            limit = JOINT_LIMITS.get(name)
+                            if limit is not None and not (limit[0] <= number <= limit[1]):
+                                unknown.append(f"{name}.q")
+                                continue
                             self._q[index] = number
                         elif field == "dq":
                             self._dq[index] = number
@@ -953,6 +1066,9 @@ class _SegmentDdsController:
             normalized[name] = number
         if unknown:
             return {"success": False, "message": f"Unknown or non-{self._label} joints", "unknown_joints": unknown}
+        out_of_range = _range_errors(normalized)
+        if out_of_range:
+            return {"success": False, "message": f"{self._label} joint angles exceed safe limits", "out_of_range": out_of_range}
         result = self._stream.set_joint_fields({name: {"q": value} for name, value in normalized.items()})
         self._stream.set_active(True)
         result["state"] = "active"
@@ -1093,6 +1209,9 @@ class _ArmDdsController:
             normalized[name] = number
         if unknown:
             return {"success": False, "message": "Unknown or non-arm joints", "unknown_joints": unknown}
+        out_of_range = _range_errors(normalized)
+        if out_of_range:
+            return {"success": False, "message": "Joint angles exceed safe limits", "out_of_range": out_of_range}
         with self._lock:
             self._target.update(normalized)
             self._active = True
@@ -1122,24 +1241,30 @@ class ArmPlugin:
         )
 
     def get_tool(self):
+        all_joints = [name for group in ARM_GROUPS.values() for name in group]
+        properties = {"action": {"type": "string", "enum": ["enable", "disable", *[f"set_{g}" for g in ARM_GROUPS], "set_joints", "zero"]}}
+        properties.update({name: _joint_property(name) for name in all_joints})
+        properties["joints"] = {"type": "object", "description": "(高级)按 关节名→弧度 直接设置"}
+        x_actions = {
+            "enable": {"params": [], "description": "启动上肢 rt/lowcmd 控制"},
+            "disable": {"params": [], "description": "释放上肢控制"},
+            "set_joints": {"params": ["joints"], "description": "(高级)按关节名直接设置任意上肢关节角度"},
+            "zero": {"params": [], "description": "上肢关节全部回零"},
+        }
+        x_actions.update({
+            f"set_{group}": {"params": joints, "description": f"设置{GROUP_LABELS.get(group, group)}关节角度(弧度),不填的保持当前姿态"}
+            for group, joints in ARM_GROUPS.items()
+        })
         return {
             "name": "arm",
             "type": "actuator",
             "multiInstance": False,
-            "description": "Adam waist/arm/wrist control through periodic DDS rt/lowcmd; use while high-level robot is standing",
+            "description": "Adam upper-body (waist/neck/shoulder/elbow/wrist) position control via DDS rt/lowcmd; use while high-level robot is standing",
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["enable", "disable", "set_joints", "zero"]},
-                    "joints": {"type": "object", "description": "Joint name to radian value, e.g. shoulderPitch_Left"},
-                },
+                "properties": properties,
                 "required": ["action"],
-                "x-action-params": {
-                    "enable": {"params": [], "description": "Enable periodic rt/lowcmd arm control"},
-                    "disable": {"params": [], "description": "Release arm lowcmd control"},
-                    "set_joints": {"params": ["joints"], "description": "Set one or more arm/waist joint targets in radians"},
-                    "zero": {"params": [], "description": "Set controlled upper-body joints to zero"},
-                },
+                "x-action-params": x_actions,
             },
         }
 
@@ -1149,11 +1274,19 @@ class ArmPlugin:
     def stop(self):
         self._controller.stop()
 
+    ARM_SET_GROUP = {f"set_{group}": group for group in ARM_GROUPS}
+
     def dispatch(self, action, args):
         if action == "enable":
             return self._controller.enable()
         if action == "disable":
             return self._controller.disable()
+        group = self.ARM_SET_GROUP.get(action)
+        if group is not None:
+            joints = {name: args[name] for name in ARM_GROUPS[group] if name in args}
+            if not joints:
+                return {"success": True, "message": "未提供任何关节角度,保持当前姿态"}
+            return self._controller.set_joints(joints)
         if action == "set_joints":
             return self._controller.set_joints(args.get("joints", {}))
         if action == "zero":
@@ -1176,6 +1309,20 @@ class LegPlugin:
         self._controller = _SegmentDdsController(lowcmd_stream, LEG_JOINT_NAMES, "leg")
 
     def get_tool(self):
+        all_joints = [name for group in LEG_GROUPS.values() for name in group]
+        properties = {"action": {"type": "string", "enum": ["enable", "disable", *[f"set_{g}" for g in LEG_GROUPS], "set_joints", "zero"]}}
+        properties.update({name: _joint_property(name) for name in all_joints})
+        properties["joints"] = {"type": "object", "description": "(高级)按 关节名→弧度 直接设置"}
+        x_actions = {
+            "enable": {"params": [], "description": "启动下肢 rt/lowcmd 控制"},
+            "disable": {"params": [], "description": "释放下肢控制"},
+            "set_joints": {"params": ["joints"], "description": "(高级)按关节名直接设置任意下肢关节角度"},
+            "zero": {"params": [], "description": "下肢关节全部回零"},
+        }
+        x_actions.update({
+            f"set_{group}": {"params": joints, "description": f"设置{GROUP_LABELS.get(group, group)}关节角度(弧度),不填的保持当前姿态"}
+            for group, joints in LEG_GROUPS.items()
+        })
         return {
             "name": "leg",
             "type": "actuator",
@@ -1183,17 +1330,9 @@ class LegPlugin:
             "description": "Adam lower-body (hip/knee/ankle) position control via DDS rt/lowcmd; use while high-level robot is standing or in the low-level pipeline",
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["enable", "disable", "set_joints", "zero"]},
-                    "joints": {"type": "object", "description": "Leg joint name to radian value, e.g. hipPitch_Left"},
-                },
+                "properties": properties,
                 "required": ["action"],
-                "x-action-params": {
-                    "enable": {"params": [], "description": "Enable periodic rt/lowcmd leg control"},
-                    "disable": {"params": [], "description": "Release leg lowcmd control"},
-                    "set_joints": {"params": ["joints"], "description": "Set one or more leg joint targets in radians"},
-                    "zero": {"params": [], "description": "Set controlled leg joints to zero"},
-                },
+                "x-action-params": x_actions,
             },
         }
 
@@ -1203,11 +1342,19 @@ class LegPlugin:
     def stop(self):
         self._controller.stop()
 
+    LEG_SET_GROUP = {f"set_{group}": group for group in LEG_GROUPS}
+
     def dispatch(self, action, args):
         if action == "enable":
             return self._controller.enable()
         if action == "disable":
             return self._controller.disable()
+        group = self.LEG_SET_GROUP.get(action)
+        if group is not None:
+            joints = {name: args[name] for name in LEG_GROUPS[group] if name in args}
+            if not joints:
+                return {"success": True, "message": "未提供任何关节角度,保持当前姿态"}
+            return self._controller.set_joints(joints)
         if action == "set_joints":
             return self._controller.set_joints(args.get("joints", {}))
         if action == "zero":
