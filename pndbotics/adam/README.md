@@ -39,6 +39,10 @@ Cards:
   It is disabled by default to avoid continuous GPU/bandwidth use and can be
   enabled in `config.yaml` or toggled with the card's `start`/`stop` action.
 
+The head-mounted ZED Mini is installed upside down. `camera_flip: true` uses
+the ZED SDK's native camera-data flip so RGB, depth and point-cloud outputs
+remain aligned; set it to `false` only when the camera is physically upright.
+
 The ZED Mini is a local USB device on the Jetson Orin. The deployment mounts
 the host's `/usr/local/zed` SDK and its aarch64 `pyzed` extension into the
 privileged container; no ZED network streaming sender is used by this driver.

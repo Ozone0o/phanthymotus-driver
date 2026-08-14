@@ -1184,6 +1184,10 @@ class ZedCameraPlugin:
         self._depth_mode_name = str(
             self._config.get("depth_mode", "PERFORMANCE")).upper()
         self._camera_fps = max(1, min(int(self._config.get("fps", 15)), 60))
+        # The ZED Mini on Adam's head is physically mounted upside down.  Let
+        # the SDK rotate the complete camera data path (RGB, depth and point
+        # cloud) together so the three outputs remain pixel/geometry aligned.
+        self._camera_flip = bool(self._config.get("camera_flip", True))
 
         self._running = False
         self._available = False
@@ -1203,6 +1207,7 @@ class ZedCameraPlugin:
             "last_depth_ts_ms": None,
             "last_pointcloud_ts_ms": None,
             "pointcloud_enabled": self._pointcloud_enabled,
+            "camera_flip": self._camera_flip,
         }
 
         self._pub_node = Node("adam_zed_camera")
@@ -1371,6 +1376,7 @@ class ZedCameraPlugin:
             },
             "error": None,
             "pointcloud_enabled": self._pointcloud_enabled,
+            "camera_flip": self._camera_flip,
         }
 
     @staticmethod
@@ -1423,6 +1429,16 @@ class ZedCameraPlugin:
         params.depth_mode = depth_mode
         params.camera_fps = self._camera_fps
         params.coordinate_units = sl.UNIT.METER
+        if self._camera_flip:
+            if hasattr(params, "camera_image_flip"):
+                flip_modes = getattr(sl, "FLIP_MODE", None)
+                params.camera_image_flip = getattr(flip_modes, "ON", 1)
+            else:
+                print(
+                    "[ZedCameraPlugin] camera_flip requested but this ZED SDK "
+                    "does not expose camera_image_flip",
+                    flush=True,
+                )
         if hasattr(params, "depth_maximum_distance"):
             params.depth_maximum_distance = self._max_point_distance_m
 

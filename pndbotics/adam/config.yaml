@@ -33,6 +33,9 @@ plugins:
     # PERFORMANCE avoids the first-run neural model optimization delay. Use
     # NEURAL_LIGHT only after its Jetson model cache has been prepared.
     depth_mode: "PERFORMANCE"
+    # The head-mounted ZED Mini is installed upside down. Let the ZED SDK
+    # rotate RGB, depth and point-cloud data consistently before publishing.
+    camera_flip: true
     rgb_hz: 15
     depth_hz: 8
     info_hz: 1
