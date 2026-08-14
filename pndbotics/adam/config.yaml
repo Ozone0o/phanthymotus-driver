@@ -47,6 +47,10 @@ plugins:
       hz: 2
       max_points: 10000
       max_distance_m: 8.0
+      # Match the Tianyi point-cloud card's 15678 frame: right, up, backward.
+      # The ZED Mini IMU levels roll/pitch; the floor offset puts Y=0 at floor.
+      gravity_align: true
+      floor_offset_m: 1.50
   arm:
     enabled: true
     control_rate_hz: 400

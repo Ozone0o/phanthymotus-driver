@@ -1375,6 +1375,12 @@ class ZedCameraPlugin:
             1000, min(int(pointcloud_config.get("max_points", 10000)), 40000))
         self._max_point_distance_m = max(
             1.0, min(float(pointcloud_config.get("max_distance_m", 8.0)), 30.0))
+        self._gravity_align = bool(pointcloud_config.get("gravity_align", True))
+        # The 15678 point-cloud renderer treats Y=0 as the floor plane.  Keep
+        # this configurable because the camera height differs between Adam
+        # variants and installations.
+        self._floor_offset_m = max(
+            -3.0, min(float(pointcloud_config.get("floor_offset_m", 1.50)), 3.0))
         self._resolution_name = str(self._config.get("resolution", "VGA")).upper()
         self._depth_mode_name = str(
             self._config.get("depth_mode", "PERFORMANCE")).upper()
@@ -1390,6 +1396,8 @@ class ZedCameraPlugin:
         self._capture_thread = None
         self._info_timer = None
         self._lock = threading.Lock()
+        self._gravity_lock = threading.Lock()
+        self._gravity_world = None
         self._state = {
             "state": "idle",
             "available": False,
@@ -1403,6 +1411,10 @@ class ZedCameraPlugin:
             "last_pointcloud_ts_ms": None,
             "pointcloud_enabled": self._pointcloud_enabled,
             "camera_flip": self._camera_flip,
+            "pointcloud_frame": "right_up_backward",
+            "pointcloud_gravity_align": self._gravity_align,
+            "pointcloud_gravity_ready": False,
+            "pointcloud_floor_offset_m": self._floor_offset_m,
         }
 
         self._pub_node = Node("adam_zed_camera")
@@ -1504,7 +1516,10 @@ class ZedCameraPlugin:
                 "state": "idle",
                 "available": False,
                 "pointcloud_enabled": self._pointcloud_enabled,
+                "pointcloud_gravity_ready": False,
             })
+        with self._gravity_lock:
+            self._gravity_world = None
         self._publish_info()
 
     def _set_error(self, message):
@@ -1572,6 +1587,10 @@ class ZedCameraPlugin:
             "error": None,
             "pointcloud_enabled": self._pointcloud_enabled,
             "camera_flip": self._camera_flip,
+            "pointcloud_frame": "right_up_backward",
+            "pointcloud_gravity_align": self._gravity_align,
+            "pointcloud_gravity_ready": self._gravity_snapshot() is not None,
+            "pointcloud_floor_offset_m": self._floor_offset_m,
         }
 
     @staticmethod
@@ -1668,6 +1687,12 @@ class ZedCameraPlugin:
         next_depth = 0.0
         next_pointcloud = 0.0
         last_grab_error = None
+        sensors_data = None
+        if self._gravity_align and hasattr(sl, "SensorsData"):
+            try:
+                sensors_data = sl.SensorsData()
+            except Exception:
+                sensors_data = None
 
         try:
             while self._running:
@@ -1683,6 +1708,10 @@ class ZedCameraPlugin:
                 now_ms = int(time.time() * 1000)
                 with self._lock:
                     self._state["last_frame_ts_ms"] = now_ms
+                    pointcloud_enabled = self._pointcloud_enabled
+
+                if pointcloud_enabled and sensors_data is not None:
+                    self._update_gravity(camera, sl, sensors_data)
 
                 if now >= next_rgb:
                     try:
@@ -1700,8 +1729,6 @@ class ZedCameraPlugin:
                     next_rgb = now + 1.0 / self._rgb_hz
 
                 need_depth = now >= next_depth
-                with self._lock:
-                    pointcloud_enabled = self._pointcloud_enabled
                 need_pointcloud = pointcloud_enabled and now >= next_pointcloud
 
                 if need_depth:
@@ -1781,6 +1808,107 @@ class ZedCameraPlugin:
         cols = (np.arange(640) * source_width / 640).astype(np.int64)
         return millimetres[rows[:, None], cols[None, :]]
 
+    def _update_gravity(self, camera, sl, sensors_data):
+        """Update the camera-up direction from the ZED Mini's accelerometer.
+
+        The point cloud is in the ZED image frame (right, down, forward),
+        while the 15678 renderer expects a gravity-levelled (right, up,
+        backward) frame.  The accelerometer measures the apparent upward
+        force when the camera is stationary, so it gives us the leveling
+        direction without hard-coding the camera's mounting pitch.
+        """
+        try:
+            time_reference = getattr(getattr(sl, "TIME_REFERENCE", None),
+                                     "CURRENT", None)
+            if time_reference is None:
+                time_reference = getattr(getattr(sl, "TIME_REFERENCE", None),
+                                         "IMAGE", None)
+            if time_reference is None:
+                return
+            status = camera.get_sensors_data(sensors_data, time_reference)
+            success = getattr(getattr(sl, "ERROR_CODE", None), "SUCCESS", None)
+            if success is not None and status is not None and status != success:
+                return
+
+            imu_data = sensors_data.get_imu_data()
+            getter = getattr(imu_data, "get_linear_acceleration", None)
+            acceleration = getter() if getter is not None else getattr(
+                imu_data, "linear_acceleration", None)
+            if acceleration is None:
+                return
+            raw = tuple(float(acceleration[index]) for index in range(3))
+            if not all(math.isfinite(value) for value in raw):
+                return
+
+            # camera_image_flip rotates the image/measure path by 180 degrees
+            # around the optical axis.  Apply the same rotation to the IMU
+            # sample before converting it to the renderer's frame.
+            if self._camera_flip:
+                raw = (-raw[0], -raw[1], raw[2])
+            gravity = (raw[0], -raw[1], -raw[2])
+            magnitude = math.sqrt(sum(value * value for value in gravity))
+            if not 8.0 <= magnitude <= 11.5:
+                return
+            gravity = tuple(value / magnitude for value in gravity)
+
+            with self._gravity_lock:
+                previous = self._gravity_world
+                if previous is None:
+                    self._gravity_world = gravity
+                else:
+                    # Low-pass the gravity direction to avoid point-cloud
+                    # wobble while the robot is moving.
+                    mixed = tuple(
+                        0.95 * old + 0.05 * new
+                        for old, new in zip(previous, gravity))
+                    norm = math.sqrt(sum(value * value for value in mixed))
+                    self._gravity_world = tuple(value / norm for value in mixed)
+            with self._lock:
+                self._state["pointcloud_gravity_ready"] = True
+        except Exception:
+            # ZED models/SDK versions without an IMU expose NaN or incomplete
+            # sensor data.  Point-cloud packing intentionally falls back to
+            # the fixed optical-to-renderer mapping in that case.
+            return
+
+    def _gravity_snapshot(self):
+        with self._gravity_lock:
+            return self._gravity_world
+
+    @staticmethod
+    def _to_renderer_frame(x, y, z, gravity=None, floor_offset_m=0.0):
+        """Map optical points to the 15678 renderer and level them by gravity.
+
+        The frontend decodes packed ``(a, b, c)`` as display
+        ``(b, -c, -a)``.  Therefore this method packs the inverse of that
+        mapping after converting the ZED optical frame to
+        ``(right, up, backward)`` and optionally rotating measured up to +Y.
+        """
+        wx, wy, wz = x, -y, -z
+        if gravity is not None:
+            gx, gy, gz = gravity
+            # Rodrigues rotation taking measured up/gravity to world +Y.
+            vx, vy, vz = -gz, 0.0, gx  # gravity x (0, 1, 0)
+            sine_sq = vx * vx + vy * vy + vz * vz
+            cosine = max(-1.0, min(1.0, gy))
+            if sine_sq > 1e-8:
+                cross_x = vy * wz - vz * wy
+                cross_y = vz * wx - vx * wz
+                cross_z = vx * wy - vy * wx
+                cross2_x = vy * cross_z - vz * cross_y
+                cross2_y = vz * cross_x - vx * cross_z
+                cross2_z = vx * cross_y - vy * cross_x
+                factor = (1.0 - cosine) / sine_sq
+                wx += cross_x + factor * cross2_x
+                wy += cross_y + factor * cross2_y
+                wz += cross_z + factor * cross2_z
+            elif cosine < 0.0:
+                # The anti-parallel case is a 180-degree rotation around X.
+                wy = -wy
+                wz = -wz
+        wy += floor_offset_m
+        return -wz, wx, -wy
+
     def _pack_pointcloud(self, points, np):
         if points.ndim != 3 or points.shape[2] < 3:
             raise ValueError(f"unexpected ZED point-cloud shape {points.shape}")
@@ -1795,13 +1923,11 @@ class ZedCameraPlugin:
             stride = int(math.ceil(xyz.shape[0] / self._max_points))
             xyz = xyz[::stride][:self._max_points]
 
-        # The renderer maps packed (a,b,c) to display (b,-c,-a).  Pack the
-        # optical ZED frame (right, down, forward) as (forward, right, down)
-        # so the displayed frame is (right, up, backward).
+        gravity = self._gravity_snapshot() if self._gravity_align else None
         packed_xyz = np.empty((xyz.shape[0], 3), dtype="<f4")
-        packed_xyz[:, 0] = xyz[:, 2]
-        packed_xyz[:, 1] = xyz[:, 0]
-        packed_xyz[:, 2] = xyz[:, 1]
+        for index, (x, y, z) in enumerate(xyz):
+            packed_xyz[index] = self._to_renderer_frame(
+                float(x), float(y), float(z), gravity, self._floor_offset_m)
         return struct.pack("<II", 12, int(packed_xyz.shape[0])) + packed_xyz.tobytes()
 
     def _publish_info(self):
