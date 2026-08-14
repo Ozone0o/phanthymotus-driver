@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <unistd.h>
 
 #ifdef PSDK_ENABLED
 #include "dji_waypoint_v2.h"
@@ -29,6 +30,76 @@ static const char *s_state = "idle";
 #ifdef PSDK_ENABLED
 #define M300_WAYPOINT_MAX 256
 static T_DjiWaypointV2 s_waypoints[M300_WAYPOINT_MAX];
+static T_DjiWaypointV2MissionStatePush s_last_fc_state;
+static T_DjiWaypointV2MissionEventPush s_last_fc_event;
+static volatile int s_has_fc_state = 0;
+static volatile int s_has_fc_event = 0;
+static uint8_t s_last_logged_fc_state = 0xFF;
+
+static const char *_fc_state_name(uint8_t state) {
+    switch (state) {
+        case DJI_WAYPOINT_V2_MISSION_STATE_GROUND_STATION_NOT_START:
+            return "ground_station_not_start";
+        case DJI_WAYPOINT_V2_MISSION_STATE_MISSION_PREPARED:
+            return "mission_prepared";
+        case DJI_WAYPOINT_V2_MISSION_STATE_ENTER_MISSION:
+            return "enter_mission";
+        case DJI_WAYPOINT_V2_MISSION_STATE_EXECUTING:
+            return "executing";
+        case DJI_WAYPOINT_V2_MISSION_STATE_PAUSED:
+            return "paused";
+        case DJI_WAYPOINT_V2_MISSION_STATE_ENTER_MISSION_AFTER_ENDING_PAUSE:
+            return "enter_mission_after_pause";
+        case DJI_WAYPOINT_V2_MISSION_STATE_EXIT_MISSION:
+            return "exit_mission";
+        default:
+            return "unknown";
+    }
+}
+
+static T_DjiReturnCode _waypoint_state_cb(T_DjiWaypointV2MissionStatePush stateData) {
+    s_last_fc_state = stateData;
+    s_has_fc_state = 1;
+    if (s_last_logged_fc_state != stateData.state) {
+        s_last_logged_fc_state = stateData.state;
+        printf("[waypoint] state_cb: state=%u(%s) cur=%u velocity=%.2f m/s\n",
+               stateData.state,
+               _fc_state_name(stateData.state),
+               stateData.curWaypointIndex,
+               stateData.velocity / 100.0f);
+    }
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static T_DjiReturnCode _waypoint_event_cb(T_DjiWaypointV2MissionEventPush eventData) {
+    s_last_fc_event = eventData;
+    s_has_fc_event = 1;
+    printf("[waypoint] event_cb: event=0x%02X timestamp=%u\n",
+           eventData.event,
+           eventData.FCTimestamp);
+    return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+static int _wait_for_fc_state(uint8_t expected_state, int timeout_ms) {
+    int elapsed_ms = 0;
+    while (elapsed_ms < timeout_ms) {
+        if (s_has_fc_state && s_last_fc_state.state == expected_state)
+            return 1;
+        usleep(100000);
+        elapsed_ms += 100;
+    }
+    return 0;
+}
+
+static int _fc_state_is_uploaded(void) {
+    if (!s_has_fc_state)
+        return 0;
+    return s_last_fc_state.state == DJI_WAYPOINT_V2_MISSION_STATE_MISSION_PREPARED ||
+           s_last_fc_state.state == DJI_WAYPOINT_V2_MISSION_STATE_ENTER_MISSION ||
+           s_last_fc_state.state == DJI_WAYPOINT_V2_MISSION_STATE_EXECUTING ||
+           s_last_fc_state.state == DJI_WAYPOINT_V2_MISSION_STATE_PAUSED ||
+           s_last_fc_state.state == DJI_WAYPOINT_V2_MISSION_STATE_ENTER_MISSION_AFTER_ENDING_PAUSE;
+}
 
 static int _json_get_float(const char *json, const char *key, float fallback, float *out) {
     char pattern[64];
@@ -111,10 +182,21 @@ int waypoint_init(void) {
     s_state = "idle";
     s_last_mission_json[0] = '\0';
 #ifdef PSDK_ENABLED
+    s_has_fc_state = 0;
+    s_has_fc_event = 0;
+    s_last_logged_fc_state = 0xFF;
     T_DjiReturnCode rc = DjiWaypointV2_Init();
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         printf("[waypoint] DjiWaypointV2_Init failed: 0x%08llX\n", (unsigned long long)rc);
         return (int)rc;
+    }
+    rc = DjiWaypointV2_RegisterMissionStateCallback(_waypoint_state_cb);
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        printf("[waypoint] RegisterMissionStateCallback failed: 0x%08llX\n", (unsigned long long)rc);
+    }
+    rc = DjiWaypointV2_RegisterMissionEventCallback(_waypoint_event_cb);
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        printf("[waypoint] RegisterMissionEventCallback failed: 0x%08llX\n", (unsigned long long)rc);
     }
 #endif
     printf("[waypoint] M300 Waypoint V2 bridge initialized\n");
@@ -168,7 +250,12 @@ int waypoint_upload(const char *mission_json) {
     T_DjiReturnCode rc = DjiWaypointV2_UploadMission(&settings);
     if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
         printf("[waypoint] DjiWaypointV2_UploadMission failed: 0x%08llX\n", (unsigned long long)rc);
-        return (int)rc;
+        if (!_wait_for_fc_state(DJI_WAYPOINT_V2_MISSION_STATE_MISSION_PREPARED, 3000) &&
+            !_fc_state_is_uploaded()) {
+            return (int)rc;
+        }
+        printf("[waypoint] UploadMission return ignored because FC state is %u(%s)\n",
+               s_last_fc_state.state, _fc_state_name(s_last_fc_state.state));
     }
 #endif
     s_uploaded = 1;
@@ -184,7 +271,13 @@ int waypoint_start(void) {
     }
 #ifdef PSDK_ENABLED
     T_DjiReturnCode rc = DjiWaypointV2_Start();
-    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) return (int)rc;
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        printf("[waypoint] DjiWaypointV2_Start failed: 0x%08llX\n", (unsigned long long)rc);
+        if (!_wait_for_fc_state(DJI_WAYPOINT_V2_MISSION_STATE_EXECUTING, 3000)) {
+            return (int)rc;
+        }
+        printf("[waypoint] Start return ignored because FC state is executing\n");
+    }
 #endif
     s_state = "executing";
     return 0;
@@ -220,8 +313,24 @@ int waypoint_stop(void) {
 }
 
 int waypoint_get_status(char *buf, size_t buflen) {
+#ifdef PSDK_ENABLED
+    snprintf(buf, buflen,
+             "{\"state\":\"%s\",\"uploaded\":%s,\"version\":\"m300-waypoint-v2\","
+             "\"fc_state_valid\":%s,\"fc_state\":%u,\"fc_state_name\":\"%s\","
+             "\"fc_cur_waypoint\":%u,\"fc_velocity\":%.2f,"
+             "\"fc_event_valid\":%s,\"fc_event\":%u}",
+             s_state, s_uploaded ? "true" : "false",
+             s_has_fc_state ? "true" : "false",
+             s_has_fc_state ? s_last_fc_state.state : 0,
+             s_has_fc_state ? _fc_state_name(s_last_fc_state.state) : "unknown",
+             s_has_fc_state ? s_last_fc_state.curWaypointIndex : 0,
+             s_has_fc_state ? s_last_fc_state.velocity / 100.0f : 0.0f,
+             s_has_fc_event ? "true" : "false",
+             s_has_fc_event ? s_last_fc_event.event : 0);
+#else
     snprintf(buf, buflen, "{\"state\":\"%s\",\"uploaded\":%s,\"version\":\"m300-waypoint-v2\"}",
              s_state, s_uploaded ? "true" : "false");
+#endif
     return 0;
 }
 

@@ -1173,12 +1173,41 @@ class WaypointPlugin:
             resp = self._bridge.waypoint_upload(mission)
             if not resp.get("ok"):
                 return {"ret": -1, "error": "Upload failed", "data": resp.get("data", {})}
+            status_resp = self._bridge.waypoint_status()
+            status = status_resp.get("data", {}) if status_resp.get("ok") else {}
+            fc_state_name = status.get("fc_state_name", "")
+            upload_ready = bool(status.get("uploaded")) or fc_state_name in (
+                "mission_prepared",
+                "enter_mission",
+                "executing",
+                "paused",
+                "enter_mission_after_pause",
+            )
+            if not upload_ready:
+                return {
+                    "ret": -1,
+                    "error": "Upload state not prepared",
+                    "file": filepath,
+                    "data": status or status_resp,
+                }
             if action == "upload":
-                return {"ret": 0, "message": f"Uploaded (not started): {os.path.basename(filepath)}", "file": filepath}
+                return {
+                    "ret": 0,
+                    "message": f"Uploaded (not started): {os.path.basename(filepath)}",
+                    "file": filepath,
+                    "status": status,
+                }
             resp = self._bridge.waypoint_start()
-            if resp.get("ok"):
-                return {"ret": 0, "message": f"Executing: {os.path.basename(filepath)}", "file": filepath}
-            return {"ret": -1, "error": "Execute failed", "data": resp.get("data", {})}
+            status_resp = self._bridge.waypoint_status()
+            status = status_resp.get("data", {}) if status_resp.get("ok") else {}
+            if resp.get("ok") or status.get("fc_state_name") == "executing":
+                return {
+                    "ret": 0,
+                    "message": f"Executing: {os.path.basename(filepath)}",
+                    "file": filepath,
+                    "status": status,
+                }
+            return {"ret": -1, "error": "Execute failed", "data": resp.get("data", {}), "status": status}
 
         if action == "pause":
             resp = self._bridge.waypoint_pause()
