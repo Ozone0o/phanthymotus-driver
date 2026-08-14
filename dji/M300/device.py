@@ -907,7 +907,12 @@ class WaypointPlugin:
     WAYPOINT_DIR = "/opt/phanthy-motus/data/waypoints_m300"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, bridge):
+        import os
+
         self._bridge = bridge
+        self._mode = str(
+            os.getenv("M300_WAYPOINT_MODE", plugin_config.get("mode", "live"))
+        ).strip().lower()
         self._record_thread = None
         self._record_active = False
         self._record_points = []
@@ -916,7 +921,11 @@ class WaypointPlugin:
         self._mark_name = ""
         self._mark_active = False
         self._mission_speed = 5.0
-        import os
+        self._sim_uploaded = False
+        self._sim_state = "idle"
+        self._sim_mission = None
+        self._sim_file = ""
+        self._sim_started_at = None
         os.makedirs(self.WAYPOINT_DIR, exist_ok=True)
 
     def get_tool(self) -> dict:
@@ -974,6 +983,48 @@ class WaypointPlugin:
 
     def stop(self):
         self._record_active = False
+
+    def _sim_enabled(self) -> bool:
+        return self._mode in ("sim", "simulator", "mock")
+
+    def _sim_status(self) -> dict:
+        point_count = len((self._sim_mission or {}).get("waypoints", []))
+        elapsed = 0.0
+        if self._sim_started_at is not None:
+            elapsed = max(0.0, time.time() - self._sim_started_at)
+        fc_state_map = {
+            "idle": (0, "ground_station_not_start"),
+            "uploaded": (1, "mission_prepared"),
+            "executing": (3, "executing"),
+            "paused": (4, "paused"),
+        }
+        fc_state, fc_state_name = fc_state_map.get(self._sim_state, (0, "ground_station_not_start"))
+        cur_waypoint = 0
+        if self._sim_state == "executing" and point_count:
+            cur_waypoint = min(point_count - 1, int(elapsed))
+        return {
+            "state": self._sim_state,
+            "uploaded": self._sim_uploaded,
+            "version": "m300-waypoint-v2-simulator",
+            "mode": "simulator",
+            "file": self._sim_file,
+            "points": point_count,
+            "fc_state_valid": True,
+            "fc_state": fc_state,
+            "fc_state_name": fc_state_name,
+            "fc_cur_waypoint": cur_waypoint,
+            "fc_velocity": self._mission_speed if self._sim_state == "executing" else 0.0,
+            "fc_event_valid": False,
+            "fc_event": 0,
+        }
+
+    def _sim_upload(self, filepath: str, mission: dict) -> dict:
+        self._sim_uploaded = True
+        self._sim_state = "uploaded"
+        self._sim_mission = mission
+        self._sim_file = filepath
+        self._sim_started_at = None
+        return self._sim_status()
 
     def _get_current_gps(self) -> dict | None:
         resp = self._bridge.get_telemetry()
@@ -1170,6 +1221,23 @@ class WaypointPlugin:
             if loaded is None:
                 return {"ret": -1, "error": f"Mission not found: {args.get('name', '')}"}
             filepath, mission = loaded
+            if self._sim_enabled():
+                status = self._sim_upload(filepath, mission)
+                if action == "upload":
+                    return {
+                        "ret": 0,
+                        "message": f"Uploaded to simulator (not started): {os.path.basename(filepath)}",
+                        "file": filepath,
+                        "status": status,
+                    }
+                self._sim_state = "executing"
+                self._sim_started_at = time.time()
+                return {
+                    "ret": 0,
+                    "message": f"Executing in simulator: {os.path.basename(filepath)}",
+                    "file": filepath,
+                    "status": self._sim_status(),
+                }
             resp = self._bridge.waypoint_upload(mission)
             if not resp.get("ok"):
                 return {"ret": -1, "error": "Upload failed", "data": resp.get("data", {})}
@@ -1210,15 +1278,36 @@ class WaypointPlugin:
             return {"ret": -1, "error": "Execute failed", "data": resp.get("data", {}), "status": status}
 
         if action == "pause":
+            if self._sim_enabled():
+                if self._sim_state != "executing":
+                    return {"ret": -1, "error": "No simulator mission executing", "data": self._sim_status()}
+                self._sim_state = "paused"
+                return {"ret": 0, "data": self._sim_status()}
             resp = self._bridge.waypoint_pause()
             return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
         if action == "resume":
+            if self._sim_enabled():
+                if not self._sim_uploaded:
+                    return {"ret": -1, "error": "No simulator mission uploaded", "data": self._sim_status()}
+                self._sim_state = "executing"
+                if self._sim_started_at is None:
+                    self._sim_started_at = time.time()
+                return {"ret": 0, "data": self._sim_status()}
             resp = self._bridge.waypoint_resume()
             return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
         if action == "cancel":
+            if self._sim_enabled():
+                self._sim_uploaded = False
+                self._sim_state = "idle"
+                self._sim_mission = None
+                self._sim_file = ""
+                self._sim_started_at = None
+                return {"ret": 0, "data": self._sim_status()}
             resp = self._bridge.waypoint_stop()
             return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
         if action == "status":
+            if self._sim_enabled():
+                return self._sim_status()
             resp = self._bridge.waypoint_status()
             return resp.get("data", {"state": "unknown"})
 
