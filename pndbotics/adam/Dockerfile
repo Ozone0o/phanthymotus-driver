@@ -11,9 +11,30 @@ COPY device.py /work/device.py
 COPY grpc_client.py /work/grpc_client.py
 COPY proto/ /work/proto/
 COPY resource/ /work/resource/
+COPY deploy/ /deploy/
 
-ENV PYTHONPATH=/work
 ENV PYTHONUNBUFFERED=1
+
+# The ZED SDK itself stays on the Jetson host (licensed, architecture-specific
+# files). deploy/service.yml mounts its libraries and pyzed extension at
+# runtime. Pillow is used only to encode the SDK's BGRA frame as JPEG.
+RUN apt-get -o Acquire::AllowInsecureRepositories=true update \
+ && apt-get install -y --no-install-recommends --allow-unauthenticated \
+      libturbojpeg0 \
+      libusb-1.0-0 \
+      libegl1 \
+      libv4l-0 \
+      libx11-6 \
+      libxext6 \
+      libbsd0 \
+ && rm -rf /var/lib/apt/lists/*
+
+ARG PYPI_MIRROR=https://pypi.org/simple/
+RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} Pillow
+
+ENV PYTHONPATH=/work:/opt/pyzed
+ENV ZED_PYTHON_PATH=/opt/pyzed
+ENV LD_LIBRARY_PATH=/usr/local/zed/lib:/opt/cyclonedds/lib
 
 # 15702 is the driver's MCP endpoint.  The official robot gRPC service is a
 # separate process on the NUC and is intentionally not exposed or recreated

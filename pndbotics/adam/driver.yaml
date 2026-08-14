@@ -6,4 +6,4 @@ hardware_model: "adam"
 image_name: pnpbotics/adam
 port: 15702
 mcp_url: "http://localhost:15702/mcp"
-description: "PNDbotics Adam — gRPC high-level state/mode/loco plus DDS body and hand cards"
+description: "PNDbotics Adam — gRPC/DDS body cards plus Jetson-local ZED Mini RGB, depth, info and optional point cloud"

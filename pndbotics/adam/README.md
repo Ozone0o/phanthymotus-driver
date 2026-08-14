@@ -29,3 +29,16 @@ Cards:
 - `hand_state`: DDS `rt/handstate`, all 12 finger positions.
 - `hand`: DDS `rt/handcmd`, without the old `get_state` action.
 - `arm`: periodic DDS `rt/lowcmd` upper-body position control.
+- `camera_head`: ZED Mini left RGB as `image/jpeg`, captured directly by the
+  Jetson-local ZED SDK.
+- `camera_depth`: ZED Mini depth as `image/depth-zlib` (640x480 little-endian
+  uint16 millimetres compressed with zlib).
+- `camera_info`: ZED Mini connection state, stream settings, calibration and
+  left/right camera intrinsics as `data/json`.
+- `camera_pointcloud`: optional ZED Mini XYZ stream as `sensor/pointcloud`.
+  It is disabled by default to avoid continuous GPU/bandwidth use and can be
+  enabled in `config.yaml` or toggled with the card's `start`/`stop` action.
+
+The ZED Mini is a local USB device on the Jetson Orin. The deployment mounts
+the host's `/usr/local/zed` SDK and its aarch64 `pyzed` extension into the
+privileged container; no ZED network streaming sender is used by this driver.

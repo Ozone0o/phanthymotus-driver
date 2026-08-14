@@ -23,6 +23,26 @@ plugins:
     enabled: true
   loco:
     enabled: true
+  camera:
+    enabled: true
+    # The ZED Mini is connected to this Jetson. Keep the first version on the
+    # local SDK path; the separate network streaming sender is not required.
+    resolution: "VGA"
+    fps: 15
+    # PERFORMANCE avoids the first-run neural model optimization delay. Use
+    # NEURAL_LIGHT only after its Jetson model cache has been prepared.
+    depth_mode: "PERFORMANCE"
+    rgb_hz: 15
+    depth_hz: 8
+    info_hz: 1
+    jpeg_quality: 70
+    pointcloud:
+      # The card remains discoverable, but point-cloud GPU/transport work is
+      # opt-in. It can also be toggled with camera_pointcloud start/stop.
+      enabled: false
+      hz: 2
+      max_points: 10000
+      max_distance_m: 8.0
   arm:
     enabled: true
     control_rate_hz: 400

@@ -1,0 +1,27 @@
+pnpbotics-adam:
+  image: __IMAGE__
+  container_name: embodied-pnpbotics-adam
+  runtime: nvidia
+  privileged: true
+  volumes:
+    - /dev:/dev
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    # ZED SDK binaries and the host's Jetson/aarch64 pyzed extension are
+    # hardware-provided; keep them out of the driver image.
+    - /usr/local/zed:/usr/local/zed:ro
+    - /home/pnd-humanoid/.local/lib/python3.10/site-packages/pyzed:/opt/pyzed:ro
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=all
+    - PYTHONPATH=/work:/opt/pyzed
+    - ZED_PYTHON_PATH=/opt/pyzed
+    - LD_LIBRARY_PATH=/usr/local/zed/lib:/opt/cyclonedds/lib
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: unless-stopped
