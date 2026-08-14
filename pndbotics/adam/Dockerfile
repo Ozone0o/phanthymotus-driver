@@ -22,7 +22,7 @@ ARG APT_MIRROR_HOST=ports.ubuntu.com
 RUN sed -i "s|mirrors.tencentyun.com|${APT_MIRROR_HOST}|g" /etc/apt/sources.list \
  && apt-get -o Acquire::AllowInsecureRepositories=true update \
  && apt-get install -y --no-install-recommends --allow-unauthenticated \
-      libturbojpeg0 \
+      libturbojpeg \
       libusb-1.0-0 \
       libegl1 \
       libv4l-0 \
