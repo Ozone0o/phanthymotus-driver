@@ -1,4 +1,5 @@
 mcp_port: 15702
+name: "adam-fl"  # Agent Core registration/display name; driver id stays in driver.yaml.
 ros_namespace: ""  # auto-detect from hostname
 
 # Adam Pro exposes 31 body motors. Change to lite or sp for another model.

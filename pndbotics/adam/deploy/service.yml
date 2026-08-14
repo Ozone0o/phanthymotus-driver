@@ -1,6 +1,6 @@
 pnpbotics-adam:
   image: __IMAGE__
-  container_name: embodied-pnpbotics-adam
+  container_name: adam-fl
   runtime: nvidia
   privileged: true
   volumes:
