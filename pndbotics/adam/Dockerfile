@@ -26,6 +26,7 @@ RUN sed -i "s|mirrors.tencentyun.com|${APT_MIRROR_HOST}|g" /etc/apt/sources.list
       libturbojpeg \
       libusb-1.0-0 \
       libegl1 \
+      libgles2 \
       libv4l-0 \
       libx11-6 \
       libxext6 \
