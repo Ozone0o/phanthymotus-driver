@@ -28,5 +28,7 @@ plugins:
     enabled: true
   flight:
     enabled: true
+  waypoint:
+    enabled: true
   time_sync:
     enabled: true

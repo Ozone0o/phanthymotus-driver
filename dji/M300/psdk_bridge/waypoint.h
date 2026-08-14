@@ -4,7 +4,7 @@
 #include <stddef.h>
 
 int waypoint_init(void);
-int waypoint_upload(const char *kmz_path);
+int waypoint_upload(const char *mission_json);
 int waypoint_start(void);
 int waypoint_pause(void);
 int waypoint_resume(void);

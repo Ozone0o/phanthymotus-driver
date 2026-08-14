@@ -66,6 +66,8 @@ class _MockState:
         self.motor_on = False
         self.satellites = 18
         self.obstacle_avoidance = True
+        self.waypoint_state = "idle"
+        self.waypoint_mission = None
 
 
 _mock = _MockState()
@@ -356,6 +358,34 @@ class BridgeClient:
             "serial_number": "MOCK0000000001",
         }}
 
+    def _mock_waypoint_upload(self, args: dict) -> dict:
+        _mock.waypoint_mission = args.get("mission")
+        _mock.waypoint_state = "uploaded"
+        point_count = len((_mock.waypoint_mission or {}).get("waypoints", []))
+        return {"ok": True, "data": {"ret": 0, "state": _mock.waypoint_state, "points": point_count}}
+
+    def _mock_waypoint_start(self, args: dict) -> dict:
+        if not _mock.waypoint_mission:
+            return {"ok": False, "data": {"ret": -1, "error": "No waypoint mission uploaded"}}
+        _mock.waypoint_state = "executing"
+        return {"ok": True, "data": {"ret": 0, "state": _mock.waypoint_state}}
+
+    def _mock_waypoint_pause(self, args: dict) -> dict:
+        _mock.waypoint_state = "paused"
+        return {"ok": True, "data": {"ret": 0, "state": _mock.waypoint_state}}
+
+    def _mock_waypoint_resume(self, args: dict) -> dict:
+        _mock.waypoint_state = "executing"
+        return {"ok": True, "data": {"ret": 0, "state": _mock.waypoint_state}}
+
+    def _mock_waypoint_stop(self, args: dict) -> dict:
+        _mock.waypoint_state = "idle"
+        return {"ok": True, "data": {"ret": 0, "state": _mock.waypoint_state}}
+
+    def _mock_waypoint_status(self, args: dict) -> dict:
+        point_count = len((_mock.waypoint_mission or {}).get("waypoints", []))
+        return {"ok": True, "data": {"state": _mock.waypoint_state, "points": point_count}}
+
     # ── Public API (convenience wrappers) ──────────────────────────────────
 
     # Flight control
@@ -487,3 +517,22 @@ class BridgeClient:
 
     def sync_clock(self):
         return self._call("sync_clock")
+
+    # Waypoint V2
+    def waypoint_upload(self, mission: dict):
+        return self._call("waypoint_upload", {"mission": mission}, timeout=30.0)
+
+    def waypoint_start(self):
+        return self._call("waypoint_start")
+
+    def waypoint_pause(self):
+        return self._call("waypoint_pause")
+
+    def waypoint_resume(self):
+        return self._call("waypoint_resume")
+
+    def waypoint_stop(self):
+        return self._call("waypoint_stop")
+
+    def waypoint_status(self):
+        return self._call("waypoint_status")

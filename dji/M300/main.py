@@ -88,6 +88,12 @@ class M300DeviceBundle:
                 plugins_cfg["flight"], namespace, executor, bridge))
             print("[bundle] FlightPlugin loaded")
 
+        if plugins_cfg.get("waypoint", {}).get("enabled", False):
+            from device import WaypointPlugin
+            self._plugins.append(WaypointPlugin(
+                plugins_cfg["waypoint"], namespace, executor, bridge))
+            print("[bundle] WaypointPlugin loaded")
+
         if plugins_cfg.get("time_sync", {}).get("enabled", False):
             from device import TimeSyncPlugin
             self._plugins.append(TimeSyncPlugin(

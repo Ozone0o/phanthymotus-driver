@@ -791,6 +791,13 @@ static int _dispatch_cmd(const char *raw_json, const char *unused,
     }
 
     /* Waypoint */
+    if (strstr(raw_json, "\"waypoint_upload\"")) {
+        int r = waypoint_upload(raw_json);
+        if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");
+        else snprintf(result, result_size,
+                "{\"ok\":false,\"error\":\"waypoint_upload requires a valid M300 Waypoint V2 mission\"}");
+        return 0;
+    }
     if (strstr(raw_json, "\"waypoint_start\"")) {
         int r = waypoint_start();
         if (r == 0) snprintf(result, result_size, "{\"ok\":true,\"data\":{\"ret\":0}}");

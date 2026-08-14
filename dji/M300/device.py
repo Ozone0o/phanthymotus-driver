@@ -896,6 +896,306 @@ class FlightPlugin:
 
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  WaypointPlugin (actuator)
+#  PSDK: 运动规划 (M300 Waypoint V2 mission)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class WaypointPlugin:
+    PREFIX = "waypoint"
+
+    WAYPOINT_DIR = "/opt/phanthy-motus/data/waypoints_m300"
+
+    def __init__(self, plugin_config: dict, namespace: str, executor, bridge):
+        self._bridge = bridge
+        self._record_thread = None
+        self._record_active = False
+        self._record_points = []
+        self._record_name = ""
+        self._mark_points = []
+        self._mark_name = ""
+        self._mark_active = False
+        self._mission_speed = 5.0
+        import os
+        os.makedirs(self.WAYPOINT_DIR, exist_ok=True)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "waypoint",
+            "type": "actuator",
+            "description": (
+                "M300 Waypoint V2 mission: record GPS track or mark key points, "
+                "save a structured mission, upload, execute, pause, resume, or cancel."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "start", "stop",
+                            "record_start", "record_stop",
+                            "mark_start", "mark_point", "mark_stop",
+                            "list", "upload", "execute",
+                            "pause", "resume", "cancel", "status",
+                        ],
+                    },
+                    "name": {"type": "string", "description": "Mission name"},
+                    "tag": {"type": "string", "description": "Optional tag for mission or point"},
+                    "speed": {"type": "number", "description": "Cruise speed (m/s), 1-15", "default": 5, "minimum": 1, "maximum": 15},
+                    "return_home": {"type": "boolean", "description": "Append start point at mark_stop", "default": True},
+                    "finished_action": {
+                        "type": "string",
+                        "description": "M300 Waypoint V2 finished action",
+                        "enum": ["go_home", "no_action", "auto_land"],
+                        "default": "go_home",
+                    },
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "record_start": {"params": ["name", "tag", "speed"], "description": "Start recording GPS track"},
+                    "record_stop": {"params": ["finished_action"], "description": "Stop recording and save mission JSON"},
+                    "mark_start": {"params": ["name", "tag", "speed"], "description": "Start marking key points"},
+                    "mark_point": {"params": ["tag"], "description": "Mark current position as waypoint"},
+                    "mark_stop": {"params": ["return_home", "finished_action"], "description": "Stop marking and save mission JSON"},
+                    "list": {"params": [], "description": "List saved missions"},
+                    "upload": {"params": ["name"], "description": "Upload a saved mission only"},
+                    "execute": {"params": ["name"], "description": "Upload and start a saved mission"},
+                    "pause": {"params": [], "description": "Pause mission"},
+                    "resume": {"params": [], "description": "Resume mission"},
+                    "cancel": {"params": [], "description": "Cancel mission"},
+                    "status": {"params": [], "description": "Query mission status"},
+                },
+            },
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        self._record_active = False
+
+    def _get_current_gps(self) -> dict | None:
+        resp = self._bridge.get_telemetry()
+        if not resp.get("ok"):
+            return None
+        data = resp.get("data", {})
+        pos = data.get("position", {})
+        vel = data.get("velocity", {})
+        lat = pos.get("latitude")
+        lon = pos.get("longitude")
+        alt = pos.get("altitude")
+        if (lat is None or lon is None or
+                not (-90 <= lat <= 90 and -180 <= lon <= 180) or
+                (abs(lat) < 1e-7 and abs(lon) < 1e-7)):
+            return None
+        import math
+        vx = vel.get("vx", 0)
+        vy = vel.get("vy", 0)
+        speed = math.sqrt(vx * vx + vy * vy)
+        return {"lat": lat, "lon": lon, "alt": alt or 0, "speed": round(speed, 1)}
+
+    @staticmethod
+    def _safe_mission_name(name: str) -> str:
+        import re
+        return re.sub(r"[^A-Za-z0-9_-]+", "_", str(name)).strip("_") or "mission"
+
+    def _build_mission(self, waypoints: list, name: str, speed: float,
+                       finished_action: str = "go_home") -> dict:
+        if len(waypoints) < 2:
+            raise ValueError("M300 waypoint mission needs at least 2 points")
+        eff_speed = max(1.0, min(15.0, float(speed or 5.0)))
+        action_map = {
+            "go_home": "go_home",
+            "no_action": "no_action",
+            "auto_land": "auto_land",
+        }
+        return {
+            "version": "m300-waypoint-v2",
+            "name": self._safe_mission_name(name),
+            "repeat_times": 1,
+            "finished_action": action_map.get(finished_action, "go_home"),
+            "max_flight_speed": max(eff_speed, 10.0),
+            "auto_flight_speed": eff_speed,
+            "action_when_rc_lost": "continue",
+            "goto_first_waypoint_mode": "point_to_point",
+            "waypoints": [
+                {
+                    "index": i,
+                    "latitude": float(wp["lat"]),
+                    "longitude": float(wp["lon"]),
+                    "relative_altitude": float(wp.get("alt", 0)),
+                    "speed": eff_speed,
+                    "heading_mode": "auto",
+                    "turn_mode": "stop_and_turn",
+                }
+                for i, wp in enumerate(waypoints)
+            ],
+        }
+
+    def _save_mission(self, waypoints: list, name: str, speed: float,
+                      finished_action: str = "go_home") -> tuple[str, dict]:
+        import os
+        mission = self._build_mission(waypoints, name, speed, finished_action)
+        filename = f"{mission['name']}_{int(time.time())}.json"
+        filepath = os.path.join(self.WAYPOINT_DIR, filename)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(mission, f, ensure_ascii=False, separators=(",", ":"))
+        return filepath, mission
+
+    def _load_latest_mission(self, name: str) -> tuple[str, dict] | None:
+        import glob
+        import os
+        pattern = os.path.join(self.WAYPOINT_DIR, f"{self._safe_mission_name(name)}_*.json")
+        files = sorted(glob.glob(pattern))
+        if not files:
+            return None
+        with open(files[-1], encoding="utf-8") as f:
+            return files[-1], json.load(f)
+
+    def _record_loop(self):
+        import math
+        last_lat, last_lon = None, None
+
+        while self._record_active:
+            gps = self._get_current_gps()
+            if gps:
+                if last_lat is not None:
+                    dlat = (gps["lat"] - last_lat) * 111320
+                    dlon = (gps["lon"] - last_lon) * 111320 * math.cos(math.radians(gps["lat"]))
+                    if math.sqrt(dlat * dlat + dlon * dlon) < 1.0:
+                        time.sleep(1)
+                        continue
+                last_lat, last_lon = gps["lat"], gps["lon"]
+                self._record_points.append(gps)
+            time.sleep(1)
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        import glob
+        import os
+
+        args.pop("_tool_name", None)
+        if action in ("start", "stop"):
+            if action == "stop":
+                self.stop()
+            return {"state": "ready" if action == "start" else "idle"}
+
+        if action == "record_start":
+            if self._record_active:
+                return {"ret": -1, "error": "Recording already in progress"}
+            name = args.get("name", "track")
+            tag = args.get("tag", "")
+            self._record_name = f"{name}_{tag}" if tag else name
+            try:
+                self._mission_speed = max(1.0, min(15.0, float(args.get("speed", 5))))
+            except (TypeError, ValueError):
+                return {"ret": -1, "error": "speed must be a number between 1 and 15 m/s"}
+            self._record_points = []
+            self._record_active = True
+            self._record_thread = threading.Thread(target=self._record_loop, daemon=True)
+            self._record_thread.start()
+            return {"ret": 0, "message": f"Recording started: {self._record_name}"}
+
+        if action == "record_stop":
+            if not self._record_active:
+                return {"ret": -1, "error": "No recording in progress"}
+            self._record_active = False
+            if self._record_thread:
+                self._record_thread.join(timeout=3)
+            gps = self._get_current_gps()
+            if gps:
+                self._record_points.append(gps)
+            if len(self._record_points) < 2:
+                return {"ret": -1, "error": "Too few distinct GPS points; move at least 1 m before saving"}
+            filepath, mission = self._save_mission(
+                self._record_points, self._record_name, self._mission_speed,
+                args.get("finished_action", "go_home"),
+            )
+            return {"ret": 0, "message": f"Recorded {len(mission['waypoints'])} points", "file": filepath}
+
+        if action == "mark_start":
+            if self._mark_active:
+                return {"ret": -1, "error": "Marking already in progress"}
+            name = args.get("name", "route")
+            tag = args.get("tag", "")
+            self._mark_name = f"{name}_{tag}" if tag else name
+            try:
+                self._mission_speed = max(1.0, min(15.0, float(args.get("speed", 5))))
+            except (TypeError, ValueError):
+                return {"ret": -1, "error": "speed must be a number between 1 and 15 m/s"}
+            self._mark_points = []
+            self._mark_active = True
+            gps = self._get_current_gps()
+            if gps:
+                gps["tag"] = "start"
+                self._mark_points.append(gps)
+            return {"ret": 0, "message": f"Marking started: {self._mark_name}", "start_point": gps}
+
+        if action == "mark_point":
+            if not self._mark_active:
+                return {"ret": -1, "error": "Marking not started"}
+            gps = self._get_current_gps()
+            if not gps:
+                return {"ret": -1, "error": "GPS not available"}
+            gps["tag"] = args.get("tag", f"point_{len(self._mark_points)}")
+            self._mark_points.append(gps)
+            return {"ret": 0, "message": f"Point #{len(self._mark_points)} marked", "point": gps, "total": len(self._mark_points)}
+
+        if action == "mark_stop":
+            if not self._mark_active:
+                return {"ret": -1, "error": "Marking not started"}
+            self._mark_active = False
+            points = list(self._mark_points)
+            return_home = args.get("return_home", True)
+            if isinstance(return_home, str):
+                return_home = return_home.lower() not in ("false", "0", "no")
+            if return_home and points:
+                home = dict(points[0])
+                home["tag"] = "return_home"
+                points.append(home)
+            if len(points) < 2:
+                return {"ret": -1, "error": f"Too few points ({len(points)}), need >= 2"}
+            filepath, mission = self._save_mission(
+                points, self._mark_name, self._mission_speed,
+                args.get("finished_action", "go_home"),
+            )
+            return {"ret": 0, "message": f"Saved {len(mission['waypoints'])} waypoints", "file": filepath}
+
+        if action == "list":
+            missions = [os.path.basename(f) for f in sorted(glob.glob(os.path.join(self.WAYPOINT_DIR, "*.json")))]
+            return {"ret": 0, "missions": missions, "count": len(missions)}
+
+        if action in ("upload", "execute"):
+            loaded = self._load_latest_mission(args.get("name", ""))
+            if loaded is None:
+                return {"ret": -1, "error": f"Mission not found: {args.get('name', '')}"}
+            filepath, mission = loaded
+            resp = self._bridge.waypoint_upload(mission)
+            if not resp.get("ok"):
+                return {"ret": -1, "error": "Upload failed", "data": resp.get("data", {})}
+            if action == "upload":
+                return {"ret": 0, "message": f"Uploaded (not started): {os.path.basename(filepath)}", "file": filepath}
+            resp = self._bridge.waypoint_start()
+            if resp.get("ok"):
+                return {"ret": 0, "message": f"Executing: {os.path.basename(filepath)}", "file": filepath}
+            return {"ret": -1, "error": "Execute failed", "data": resp.get("data", {})}
+
+        if action == "pause":
+            resp = self._bridge.waypoint_pause()
+            return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
+        if action == "resume":
+            resp = self._bridge.waypoint_resume()
+            return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
+        if action == "cancel":
+            resp = self._bridge.waypoint_stop()
+            return {"ret": 0 if resp.get("ok") else -1, "data": resp.get("data", {})}
+        if action == "status":
+            resp = self._bridge.waypoint_status()
+            return resp.get("data", {"state": "unknown"})
+
+        return None
+
+
 class TimeSyncPlugin:
     PREFIX = "aircraft_info"
 
