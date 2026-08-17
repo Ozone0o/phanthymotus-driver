@@ -1233,11 +1233,11 @@ def _camera_subprocess(namespace: str):
         from turbojpeg import TurboJPEG, TJPF_BGR
         _tj = TurboJPEG()
         def encode_jpeg(bgr_image):
-            return _tj.encode(bgr_image, pixel_format=TJPF_BGR, quality=80)
+            return _tj.encode(bgr_image, pixel_format=TJPF_BGR, quality=65)
         print("[camera_subprocess] using TurboJPEG encoder", flush=True)
     except Exception:
         def encode_jpeg(bgr_image):
-            _, buf = cv2.imencode('.jpg', bgr_image, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            _, buf = cv2.imencode('.jpg', bgr_image, [cv2.IMWRITE_JPEG_QUALITY, 65])
             return buf.tobytes()
         print("[camera_subprocess] using cv2 JPEG encoder", flush=True)
 
@@ -1288,11 +1288,19 @@ def _camera_subprocess(namespace: str):
     last_status = _time.monotonic()
     last_pointcloud_frames = 0
     previous_frames = 0
+    last_rs_frame_number = None
+    real_dropped_frames = 0
     try:
         while True:
             t0 = _time.monotonic()
             frames = pipeline.wait_for_frames(timeout_ms=1000)
             t_wait = _time.monotonic() - t0
+            rs_frame_number = frames.get_frame_number()
+            if last_rs_frame_number is not None:
+                gap = rs_frame_number - last_rs_frame_number - 1
+                if gap > 0:
+                    real_dropped_frames += gap
+            last_rs_frame_number = rs_frame_number
 
             color_frame = frames.get_color_frame()
             depth_frame = frames.get_depth_frame()
@@ -1323,6 +1331,16 @@ def _camera_subprocess(namespace: str):
                 pointcloud_enabled = _POINTCLOUD_CONTROL_PATH.read_text().strip() == "1"
             except OSError:
                 pointcloud_enabled = False
+            was_pointcloud_enabled = status["pointcloud_enabled"]
+            if was_pointcloud_enabled and not pointcloud_enabled:
+                status.update({
+                    "pointcloud_frames": 0,
+                    "pointcloud_valid_points": 0,
+                    "pointcloud_range_m": None,
+                    "pointcloud_nearest_obstacle_m": None,
+                    "pointcloud_fps": 0.0,
+                })
+                last_pointcloud_frames = 0
             status["pointcloud_enabled"] = pointcloud_enabled
             if pointcloud_enabled and color_frame and depth_frame:
                 points = pointcloud.calculate(depth_frame)
@@ -1364,8 +1382,7 @@ def _camera_subprocess(namespace: str):
                 status["pointcloud_fps"] = round((status["pointcloud_frames"] - last_pointcloud_frames) / elapsed, 2)
                 status["last_frame_time"] = int(_time.time() * 1000)
                 status["frames"] = frame_count
-                expected = int(max(0.0, (now - t_start) * status["configured_fps"]))
-                status["dropped_frames"] = max(0, expected - frame_count)
+                status["dropped_frames"] = real_dropped_frames
                 info = String()
                 info.data = json.dumps(status, separators=(",", ":"))
                 info_pub.publish(info)
