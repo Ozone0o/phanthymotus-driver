@@ -1532,6 +1532,13 @@ class ZedCameraPlugin:
         self._pointcloud_mount_rotation = self._rotation_matrix_xyz(
             *(math.radians(self._pointcloud_mount_rotation_deg[axis])
               for axis in ("x", "y", "z")))
+        mount_translation = pointcloud_config.get("mount_translation_m", {})
+        if not isinstance(mount_translation, dict):
+            mount_translation = {}
+        self._pointcloud_mount_translation_m = {
+            axis: float(mount_translation.get(axis, 0.0))
+            for axis in ("x", "y", "z")
+        }
         self._resolution_name = str(self._config.get("resolution", "VGA")).upper()
         self._depth_mode_name = str(
             self._config.get("depth_mode", "PERFORMANCE")).upper()
@@ -1562,6 +1569,8 @@ class ZedCameraPlugin:
             "camera_flip": self._camera_flip,
             "pointcloud_mount_rotation_deg": dict(
                 self._pointcloud_mount_rotation_deg),
+            "pointcloud_mount_translation_m": dict(
+                self._pointcloud_mount_translation_m),
         }
 
         self._pub_node = Node("adam_zed_camera")
@@ -1990,6 +1999,9 @@ class ZedCameraPlugin:
             rotation[2][0] * camera_x
             + rotation[2][1] * camera_y
             + rotation[2][2] * camera_z)
+        display[:, 0] += self._pointcloud_mount_translation_m["x"]
+        display[:, 1] += self._pointcloud_mount_translation_m["y"]
+        display[:, 2] += self._pointcloud_mount_translation_m["z"]
         packed_xyz = np.empty((xyz.shape[0], 3), dtype="<f4")
         packed_xyz[:, 0] = -display[:, 2]
         packed_xyz[:, 1] = display[:, 0]

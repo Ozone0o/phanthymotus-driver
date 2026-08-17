@@ -45,7 +45,11 @@ remain aligned; set it to `false` only when the camera is physically upright.
 The point-cloud path also applies the fixed `pointcloud.mount_rotation_deg`
 calibration after that flip. Its X/Y/Z values are renderer-frame degrees and
 should be adjusted if the camera bracket is remounted; it is deliberately a
-static mount correction rather than an IMU-based per-frame leveling step.
+static mount correction rather than an IMU-based per-frame leveling step. The
+following `pointcloud.mount_translation_m` is then applied in the same frame;
+its `y` component is the upward offset, so Adam's default `y: 1.5` places the
+floor at the renderer's zero-height plane. Adjust it if the camera height or
+the desired ground reference changes.
 
 The ZED Mini is a local USB device on the Jetson Orin. The deployment mounts
 the host's `/usr/local/zed` SDK and its aarch64 `pyzed` extension into the
