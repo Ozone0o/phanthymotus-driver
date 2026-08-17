@@ -1522,6 +1522,16 @@ class ZedCameraPlugin:
             1000, min(int(pointcloud_config.get("max_points", 10000)), 40000))
         self._max_point_distance_m = max(
             1.0, min(float(pointcloud_config.get("max_distance_m", 8.0)), 30.0))
+        mount_rotation = pointcloud_config.get("mount_rotation_deg", {})
+        if not isinstance(mount_rotation, dict):
+            mount_rotation = {}
+        self._pointcloud_mount_rotation_deg = {
+            axis: float(mount_rotation.get(axis, 0.0))
+            for axis in ("x", "y", "z")
+        }
+        self._pointcloud_mount_rotation = self._rotation_matrix_xyz(
+            *(math.radians(self._pointcloud_mount_rotation_deg[axis])
+              for axis in ("x", "y", "z")))
         self._resolution_name = str(self._config.get("resolution", "VGA")).upper()
         self._depth_mode_name = str(
             self._config.get("depth_mode", "PERFORMANCE")).upper()
@@ -1550,6 +1560,8 @@ class ZedCameraPlugin:
             "last_pointcloud_ts_ms": None,
             "pointcloud_enabled": self._pointcloud_enabled,
             "camera_flip": self._camera_flip,
+            "pointcloud_mount_rotation_deg": dict(
+                self._pointcloud_mount_rotation_deg),
         }
 
         self._pub_node = Node("adam_zed_camera")
@@ -1719,6 +1731,8 @@ class ZedCameraPlugin:
             "error": None,
             "pointcloud_enabled": self._pointcloud_enabled,
             "camera_flip": self._camera_flip,
+            "pointcloud_mount_rotation_deg": dict(
+                self._pointcloud_mount_rotation_deg),
         }
 
     @staticmethod
@@ -1928,6 +1942,19 @@ class ZedCameraPlugin:
         cols = (np.arange(640) * source_width / 640).astype(np.int64)
         return millimetres[rows[:, None], cols[None, :]]
 
+    @staticmethod
+    def _rotation_matrix_xyz(x_rad, y_rad, z_rad):
+        """Return a renderer-frame rotation that applies X, then Y, then Z."""
+        sx, cx = math.sin(x_rad), math.cos(x_rad)
+        sy, cy = math.sin(y_rad), math.cos(y_rad)
+        sz, cz = math.sin(z_rad), math.cos(z_rad)
+        # Column-vector convention: Rz @ Ry @ Rx.
+        return (
+            (cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx),
+            (sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx),
+            (-sy, cy * sx, cy * cx),
+        )
+
     def _pack_pointcloud(self, points, np):
         if points.ndim != 3 or points.shape[2] < 3:
             raise ValueError(f"unexpected ZED point-cloud shape {points.shape}")
@@ -1942,13 +1969,31 @@ class ZedCameraPlugin:
             stride = int(math.ceil(xyz.shape[0] / self._max_points))
             xyz = xyz[::stride][:self._max_points]
 
-        # The renderer maps packed (a,b,c) to display (b,-c,-a).  Pack the
-        # optical ZED frame (right, down, forward) as (forward, right, down)
-        # so the displayed frame is (right, up, backward).
+        # First express the optical ZED frame in the renderer's default frame:
+        # (right, down, forward) -> (right, up, backward).  Correct the fixed
+        # camera mounting angle in that frame, then invert the renderer's
+        # configurable default mapping display=(packed_y,-packed_z,-packed_x).
+        rotation = self._pointcloud_mount_rotation
+        display = np.empty_like(xyz, dtype="<f4")
+        camera_x = xyz[:, 0]
+        camera_y = -xyz[:, 1]
+        camera_z = -xyz[:, 2]
+        display[:, 0] = (
+            rotation[0][0] * camera_x
+            + rotation[0][1] * camera_y
+            + rotation[0][2] * camera_z)
+        display[:, 1] = (
+            rotation[1][0] * camera_x
+            + rotation[1][1] * camera_y
+            + rotation[1][2] * camera_z)
+        display[:, 2] = (
+            rotation[2][0] * camera_x
+            + rotation[2][1] * camera_y
+            + rotation[2][2] * camera_z)
         packed_xyz = np.empty((xyz.shape[0], 3), dtype="<f4")
-        packed_xyz[:, 0] = xyz[:, 2]
-        packed_xyz[:, 1] = xyz[:, 0]
-        packed_xyz[:, 2] = xyz[:, 1]
+        packed_xyz[:, 0] = -display[:, 2]
+        packed_xyz[:, 1] = display[:, 0]
+        packed_xyz[:, 2] = -display[:, 1]
         return struct.pack("<II", 12, int(packed_xyz.shape[0])) + packed_xyz.tobytes()
 
     def _publish_info(self):

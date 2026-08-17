@@ -42,6 +42,10 @@ Cards:
 The head-mounted ZED Mini is installed upside down. `camera_flip: true` uses
 the ZED SDK's native camera-data flip so RGB, depth and point-cloud outputs
 remain aligned; set it to `false` only when the camera is physically upright.
+The point-cloud path also applies the fixed `pointcloud.mount_rotation_deg`
+calibration after that flip. Its X/Y/Z values are renderer-frame degrees and
+should be adjusted if the camera bracket is remounted; it is deliberately a
+static mount correction rather than an IMU-based per-frame leveling step.
 
 The ZED Mini is a local USB device on the Jetson Orin. The deployment mounts
 the host's `/usr/local/zed` SDK and its aarch64 `pyzed` extension into the

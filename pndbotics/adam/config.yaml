@@ -47,6 +47,13 @@ plugins:
       hz: 2
       max_points: 10000
       max_distance_m: 8.0
+      # Fixed camera-mount compensation in the renderer frame, applied after
+      # camera_flip.  The values below are calibrated from Adam's current
+      # ZED-Mini installation; order is X, Y, Z and units are degrees.
+      mount_rotation_deg:
+        x: -14.2
+        y: 0.0
+        z: 0.8
   arm:
     enabled: true
     control_rate_hz: 400
