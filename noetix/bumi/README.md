@@ -2,6 +2,15 @@
 
 The bundle exposes the original Bumi sensor, locomotion, audio and camera cards plus one higher-level motion-state card backed by documented Noetix SDK APIs. All card implementations are kept in `device.py`.
 
+## Camera health and point cloud cards
+
+The camera bundle also exposes:
+
+- `camera_info`: read-only JSON health telemetry for the RealSense D435i, including connection, RGB/depth status, configured resolution/FPS, measured FPS, estimated dropped frames, last-frame timestamp, errors, and device-busy state.
+- `pointcloud`: an on-demand XYZ `PointCloud2` stream. It is discoverable while idle, but point-cloud calculation is disabled by default. The card's `start` action enables calculation and publication; `stop` disables it and releases the point-cloud workload. It shares the existing camera pipeline and never opens a second RealSense pipeline, avoiding `Device or resource busy` conflicts with the existing RGB/depth cards.
+
+The point-cloud status is also included in the camera health JSON: measured point-cloud FPS, valid-point count, min/max range, nearest valid point, frame ID, and whether the card is enabled.
+
 ## New cards
 
 ### `motion_state`
