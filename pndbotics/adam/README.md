@@ -26,12 +26,15 @@ Cards:
 - `robot_state`: official `RobotControl.GetRobotState` response fields.
 - `switch_mode`: official `RobotControl.SetMode` modes.
 - `loco`: official `RobotControl.SetSpeed` (`move` / `stop_move`).
-- `hand_state`: PND DDS `rt/handstate`, with 12 raw joint positions in the
+- `hand_state`: PND DDS `rt/handstate`, with 12 raw `client_positions` in the
   order `[pinky, ring, middle, index, thumb-bend, thumb-rotation]` for the
-  left hand followed by the right hand. PND positions are `0` (fully open) to
-  `1000` (fully closed).
-- `hand`: PND DDS `rt/handcmd`, using the same 12-joint order and range; the
-  `open`/`close` actions send all-zero/all-1000 commands respectively.
+  left hand followed by the right hand. This robot's bridge uses the
+  `0-1800` client coordinate system; the observed open pose is
+  `[1800, 1800, 1800, 1800, 1600, 0]` per hand.
+- `hand`: PND DDS `rt/handcmd`, using the same raw client coordinate system
+  and joint order. The `open` action sends the observed PND client pose and
+  `close` sends twelve zeroes; `set_fingers` accepts values from `0` to
+  `1800`.
 - `arm`: periodic DDS `rt/lowcmd` upper-body position control.
 - `camera_head`: ZED Mini left RGB as `image/jpeg`, captured directly by the
   Jetson-local ZED SDK.

@@ -77,7 +77,7 @@ plugins:
     publish_rate_hz: 50
   hand:
     enabled: true
-    # PND dexterous hand: 0 = fully open, 1000 = fully closed.
+    # This robot's x86 DDS bridge uses PND client_positions (0-1800).
     hand_type: "pnd"
     control_rate_hz: 400
   model:

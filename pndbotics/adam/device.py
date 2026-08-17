@@ -567,12 +567,24 @@ class LocoPlugin:
 # DDS hand state and hand command cards
 # ---------------------------------------------------------------------------
 
+# The x86 hand bridge exposes the PND hand through its ``client_positions``
+# representation.  This is deliberately different from the PND actuator-side
+# 0-1000 values: the bridge currently publishes the following client pose and
+# expects commands in the same coordinate system.
+PND_CLIENT_OPEN_POSITIONS = [
+    1800, 1800, 1800, 1800, 1600, 0,
+    1800, 1800, 1800, 1800, 1600, 0,
+]
+PND_CLIENT_CLOSED_POSITIONS = [0] * 12
+
 HAND_PROFILES = {
     "pnd": {
-        "max_value": 1000,
-        "open_value": 0,
-        "closed_value": 1000,
-        "position_range": "0-1000",
+        "max_value": 1800,
+        "open_value": 1800,
+        "closed_value": 0,
+        "open_positions": PND_CLIENT_OPEN_POSITIONS,
+        "closed_positions": PND_CLIENT_CLOSED_POSITIONS,
+        "position_range": "0-1800 (PND client_positions)",
         "order": "pinky, ring, middle, index, thumb-bend, thumb-rotation",
     },
     # Keep the legacy profile available for older deployments that still
@@ -591,7 +603,18 @@ def _hand_profile(plugin_config):
     hand_type = str(plugin_config.get("hand_type", "pnd")).strip().lower()
     if hand_type not in HAND_PROFILES:
         hand_type = "pnd"
-    return hand_type, HAND_PROFILES[hand_type]
+    profile = HAND_PROFILES[hand_type]
+    # Keep the profile immutable from a plugin instance's point of view. This
+    # also ensures an accidental mutation of one hand's target cannot affect
+    # the other hand card.
+    profile = dict(profile)
+    profile["open_positions"] = list(
+        profile.get("open_positions", [profile["open_value"]] * 12)
+    )
+    profile["closed_positions"] = list(
+        profile.get("closed_positions", [profile["closed_value"]] * 12)
+    )
+    return hand_type, profile
 
 def _hand_payload(message):
     positions = [int(value) for value in list(getattr(message, "position", []))[:12]]
@@ -652,7 +675,7 @@ class HandStatePlugin:
             "multiInstance": False,
             "description": (
                 "PND dexterous hand state via DDS rt/handstate "
-                f"(raw position {self._hand_profile['position_range']}; "
+                f"(raw client position {self._hand_profile['position_range']}; "
                 f"order: {self._hand_profile['order']}; "
                 "left[0:6], right[6:12])"
             ),
@@ -698,6 +721,8 @@ class HandStatePlugin:
                 "position_range": self._hand_profile["position_range"],
                 "open_value": self._hand_profile["open_value"],
                 "closed_value": self._hand_profile["closed_value"],
+                "open_positions": list(self._hand_profile["open_positions"]),
+                "closed_positions": list(self._hand_profile["closed_positions"]),
                 "finger_order": self._hand_profile["order"],
                 "topic_out": [{"topic": self._node.topic, "format": "data/json"}],
             }
@@ -718,9 +743,11 @@ class HandPlugin:
         self._max_value = self._hand_profile["max_value"]
         self._open_value = self._hand_profile["open_value"]
         self._closed_value = self._hand_profile["closed_value"]
+        self._open_positions = list(self._hand_profile["open_positions"])
+        self._closed_positions = list(self._hand_profile["closed_positions"])
         self._rate_hz = float(plugin_config.get("control_rate_hz", 400))
         self._hand_pub = hand_pub
-        self._target = [self._open_value] * 12
+        self._target = list(self._open_positions)
         self._active = False
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -734,7 +761,8 @@ class HandPlugin:
             "multiInstance": False,
             "description": (
                 f"PND dexterous hand control via DDS rt/handcmd "
-                f"({self._open_value}=fully open, {self._closed_value}=fully closed; "
+                f"(open_positions={self._open_positions}, "
+                f"closed_positions={self._closed_positions}; "
                 f"position range {self._hand_profile['position_range']})"
             ),
             "inputSchema": {
@@ -746,9 +774,9 @@ class HandPlugin:
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "open": {"params": [], "description": f"Fully open all 12 joints ({self._open_value})"},
-                    "close": {"params": [], "description": f"Fully close all 12 joints ({self._closed_value})"},
-                    "set_fingers": {"params": ["left", "right"], "description": "Set all 12 finger positions"},
+                    "open": {"params": [], "description": f"Open with the PND client pose {self._open_positions}"},
+                    "close": {"params": [], "description": f"Close with the PND client pose {self._closed_positions}"},
+                    "set_fingers": {"params": ["left", "right"], "description": f"Set all 12 raw client positions in {self._hand_profile['position_range']}"},
                 },
             },
         }
@@ -809,11 +837,11 @@ class HandPlugin:
 
     def dispatch(self, action, args):
         if action == "open":
-            result = self._set_target([self._open_value] * 12)
+            result = self._set_target(self._open_positions)
             result["message"] = "All fingers opened" if result.get("success") else result.get("message")
             return result
         if action == "close":
-            result = self._set_target([self._closed_value] * 12)
+            result = self._set_target(self._closed_positions)
             result["message"] = "All fingers closed" if result.get("success") else result.get("message")
             return result
         if action == "set_fingers":
@@ -837,6 +865,8 @@ class HandPlugin:
                 "position_range": self._hand_profile["position_range"],
                 "open_value": self._open_value,
                 "closed_value": self._closed_value,
+                "open_positions": list(self._open_positions),
+                "closed_positions": list(self._closed_positions),
                 "finger_order": self._hand_profile["order"],
             }
         return None
