@@ -1345,7 +1345,7 @@ def _camera_subprocess(namespace: str):
                     sampled = sampled[:, [2, 0, 1]]
                     # Translate the display cloud so the calibrated floor is
                     # approximately at the AgentCore ground plane.
-                    sampled[:, 2] += _CAMERA_HEIGHT_M
+                    sampled[:, 2] -= _CAMERA_HEIGHT_M
                     blob = sampled.astype("<f4", copy=False).tobytes()
                     payload = struct.pack("<II", 12, len(sampled)) + blob
                     msg = _UInt8MultiArray()
