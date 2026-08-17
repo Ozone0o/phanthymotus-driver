@@ -55,11 +55,11 @@ plugins:
         y: 0.0
         z: 0.8
       # Static translation in the renderer frame, applied after rotation.
-      # +Y is up; 1.5 m places the floor at the renderer's Y=0 plane while
-      # keeping the camera origin approximately 1.5 m above the floor.
+      # +Y is up; 1.8 m places the floor at the renderer's Y=0 plane while
+      # keeping the camera origin approximately 1.8 m above the floor.
       mount_translation_m:
         x: 0.0
-        y: 1.5
+        y: 1.8
         z: 0.0
   arm:
     enabled: true

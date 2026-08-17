@@ -47,7 +47,7 @@ calibration after that flip. Its X/Y/Z values are renderer-frame degrees and
 should be adjusted if the camera bracket is remounted; it is deliberately a
 static mount correction rather than an IMU-based per-frame leveling step. The
 following `pointcloud.mount_translation_m` is then applied in the same frame;
-its `y` component is the upward offset, so Adam's default `y: 1.5` places the
+its `y` component is the upward offset, so Adam's default `y: 1.8` places the
 floor at the renderer's zero-height plane. Adjust it if the camera height or
 the desired ground reference changes.
 
