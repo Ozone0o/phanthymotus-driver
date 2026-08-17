@@ -1317,6 +1317,10 @@ def _camera_subprocess(namespace: str):
                     count = min(len(valid), max_points)
                     stride = max(1, len(valid) // count)
                     sampled = valid[::stride][:count]
+                    # RealSense optical frame (X right, Y down, Z forward)
+                    # to the AgentCore renderer frame used by Tianyi/G1.
+                    # Keep `valid` unchanged below for distance statistics.
+                    sampled = sampled[:, [2, 0, 1]]
                     blob = sampled.astype("<f4", copy=False).tobytes()
                     payload = struct.pack("<II", 12, len(sampled)) + blob
                     msg = _UInt8MultiArray()
