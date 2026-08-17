@@ -1166,6 +1166,7 @@ _CAMERA_STATUS_PATH = Path(tempfile.gettempdir()) / "bumi_camera_status.json"
 _POINTCLOUD_CONTROL_PATH = Path(tempfile.gettempdir()) / "bumi_pointcloud_control"
 _CAMERA_PITCH_DEG = -10.263
 _CAMERA_ROLL_DEG = 0.853
+_CAMERA_HEIGHT_M = 1.10
 
 
 def _apply_camera_extrinsics(points, np):
@@ -1342,6 +1343,9 @@ def _camera_subprocess(namespace: str):
                     # Then convert RealSense XYZ to the AgentCore/Tianyi frame.
                     # Keep `valid` unchanged below for distance statistics.
                     sampled = sampled[:, [2, 0, 1]]
+                    # Translate the display cloud so the calibrated floor is
+                    # approximately at the AgentCore ground plane.
+                    sampled[:, 1] += _CAMERA_HEIGHT_M
                     blob = sampled.astype("<f4", copy=False).tobytes()
                     payload = struct.pack("<II", 12, len(sampled)) + blob
                     msg = _UInt8MultiArray()
