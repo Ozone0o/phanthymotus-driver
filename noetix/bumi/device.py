@@ -1196,7 +1196,7 @@ def _camera_subprocess(namespace: str):
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
     from sensor_msgs.msg import CompressedImage as _CompressedImage
     from sensor_msgs.msg import Image as _SensorImage
-    from sensor_msgs.msg import PointCloud2 as _PointCloud2, PointField as _PointField
+    from std_msgs.msg import UInt8MultiArray as _UInt8MultiArray
 
     _QOS = QoSProfile(
         reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -1230,7 +1230,9 @@ def _camera_subprocess(namespace: str):
     color_pub = node.create_publisher(_CompressedImage, color_topic, _QOS)
     depth_pub = node.create_publisher(_CompressedImage, depth_topic, _QOS)
     info_pub = node.create_publisher(String, info_topic, _QOS)
-    pointcloud_pub = node.create_publisher(_PointCloud2, pointcloud_topic, _QOS)
+    # AgentCore's sensor/pointcloud stream uses a UInt8MultiArray envelope:
+    # <uint32 point_step><uint32 point_count><XYZ float32 bytes>.
+    pointcloud_pub = node.create_publisher(_UInt8MultiArray, pointcloud_topic, _QOS)
 
     pipeline = rs.pipeline()
     pointcloud = rs.pointcloud()
@@ -1309,20 +1311,17 @@ def _camera_subprocess(namespace: str):
                 valid = vertices[finite]
                 valid = valid[_np.linalg.norm(valid, axis=1) > 0.05]
                 if len(valid):
-                    blob = valid.astype("<f4", copy=False).tobytes()
-                    pcl = _PointCloud2()
-                    pcl.header.stamp = node.get_clock().now().to_msg()
-                    pcl.header.frame_id = "bumi_camera_depth"
-                    pcl.height, pcl.width = 1, len(valid)
-                    pcl.fields = [
-                        _PointField(name="x", offset=0, datatype=_PointField.FLOAT32, count=1),
-                        _PointField(name="y", offset=4, datatype=_PointField.FLOAT32, count=1),
-                        _PointField(name="z", offset=8, datatype=_PointField.FLOAT32, count=1),
-                    ]
-                    pcl.is_bigendian = False
-                    pcl.point_step, pcl.row_step = 12, len(blob)
-                    pcl.data, pcl.is_dense = blob, True
-                    pointcloud_pub.publish(pcl)
+                    # Match the existing Tianyi/G1 AgentCore point-cloud
+                    # protocol and cap the payload to keep the UI responsive.
+                    max_points = 10000
+                    count = min(len(valid), max_points)
+                    stride = max(1, len(valid) // count)
+                    sampled = valid[::stride][:count]
+                    blob = sampled.astype("<f4", copy=False).tobytes()
+                    payload = struct.pack("<II", 12, len(sampled)) + blob
+                    msg = _UInt8MultiArray()
+                    msg.data = list(payload)
+                    pointcloud_pub.publish(msg)
                     distances = _np.linalg.norm(valid, axis=1)
                     status["pointcloud_valid_points"] = int(len(valid))
                     status["pointcloud_range_m"] = [float(distances.min()), float(distances.max())]
@@ -1390,7 +1389,7 @@ class CameraPlugin:
                 "name": "pointcloud",
                 "type": "sensor",
                 "multiInstance": False,
-                "description": "Bumi RealSense point cloud. Disabled by default; start enables computation and stop releases point-cloud work. Publishes XYZ PointCloud2 only while enabled.",
+                "description": "Bumi RealSense point cloud. Disabled by default; start enables computation and stop releases point-cloud work. Publishes AgentCore sensor/pointcloud binary only while enabled.",
                 "inputSchema": {"type": "object", "properties": {"action": {"type": "string", "enum": ["start", "stop", "info"]}}},
                 "x-action-params": {"start": {"params": []}, "stop": {"params": []}, "info": {"params": []}},
                 "topic_out": [{"topic": self._pointcloud_topic, "format": "sensor/pointcloud"}],
