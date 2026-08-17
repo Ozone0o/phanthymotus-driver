@@ -26,8 +26,12 @@ Cards:
 - `robot_state`: official `RobotControl.GetRobotState` response fields.
 - `switch_mode`: official `RobotControl.SetMode` modes.
 - `loco`: official `RobotControl.SetSpeed` (`move` / `stop_move`).
-- `hand_state`: DDS `rt/handstate`, all 12 finger positions.
-- `hand`: DDS `rt/handcmd`, without the old `get_state` action.
+- `hand_state`: PND DDS `rt/handstate`, with 12 raw joint positions in the
+  order `[pinky, ring, middle, index, thumb-bend, thumb-rotation]` for the
+  left hand followed by the right hand. PND positions are `0` (fully open) to
+  `1000` (fully closed).
+- `hand`: PND DDS `rt/handcmd`, using the same 12-joint order and range; the
+  `open`/`close` actions send all-zero/all-1000 commands respectively.
 - `arm`: periodic DDS `rt/lowcmd` upper-body position control.
 - `camera_head`: ZED Mini left RGB as `image/jpeg`, captured directly by the
   Jetson-local ZED SDK.

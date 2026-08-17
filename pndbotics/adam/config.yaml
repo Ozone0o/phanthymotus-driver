@@ -73,11 +73,12 @@ plugins:
     enabled: true
   hand_state:
     enabled: true
+    hand_type: "pnd"
     publish_rate_hz: 50
   hand:
     enabled: true
-    # The connected board reports hand positions up to 1800 (Inspire hand).
-    hand_type: "inspire"
+    # PND dexterous hand: 0 = fully open, 1000 = fully closed.
+    hand_type: "pnd"
     control_rate_hz: 400
   model:
     enabled: true

@@ -567,6 +567,32 @@ class LocoPlugin:
 # DDS hand state and hand command cards
 # ---------------------------------------------------------------------------
 
+HAND_PROFILES = {
+    "pnd": {
+        "max_value": 1000,
+        "open_value": 0,
+        "closed_value": 1000,
+        "position_range": "0-1000",
+        "order": "pinky, ring, middle, index, thumb-bend, thumb-rotation",
+    },
+    # Keep the legacy profile available for older deployments that still
+    # explicitly select it. PND is the default for both hand cards.
+    "inspire": {
+        "max_value": 1800,
+        "open_value": 1800,
+        "closed_value": 0,
+        "position_range": "0-1800",
+        "order": "pinky, ring, middle, index, thumb, lateral",
+    },
+}
+
+
+def _hand_profile(plugin_config):
+    hand_type = str(plugin_config.get("hand_type", "pnd")).strip().lower()
+    if hand_type not in HAND_PROFILES:
+        hand_type = "pnd"
+    return hand_type, HAND_PROFILES[hand_type]
+
 def _hand_payload(message):
     positions = [int(value) for value in list(getattr(message, "position", []))[:12]]
     positions += [0] * (12 - len(positions))
@@ -609,6 +635,7 @@ class HandStatePlugin:
     PREFIX = "hand_state"
 
     def __init__(self, plugin_config, namespace, executor, handstate_sub=None, **_kwargs):
+        self._hand_type, self._hand_profile = _hand_profile(plugin_config)
         self._running = False
         self._stop_event = threading.Event()
         self._thread = None
@@ -623,7 +650,12 @@ class HandStatePlugin:
             "name": "hand_state",
             "type": "sensor",
             "multiInstance": False,
-            "description": "Adam DDS rt/handstate — 12 finger positions: left[0:6], right[6:12]",
+            "description": (
+                "PND dexterous hand state via DDS rt/handstate "
+                f"(raw position {self._hand_profile['position_range']}; "
+                f"order: {self._hand_profile['order']}; "
+                "left[0:6], right[6:12])"
+            ),
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._node.topic, "format": "data/json"}],
         }
@@ -660,7 +692,15 @@ class HandStatePlugin:
                 return {"state": "unknown", "message": "No rt/handstate sample received yet"}
             return payload
         if action == "info":
-            return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._node.topic, "format": "data/json"}]}
+            return {
+                "state": "running" if self._running else "idle",
+                "hand_type": self._hand_type,
+                "position_range": self._hand_profile["position_range"],
+                "open_value": self._hand_profile["open_value"],
+                "closed_value": self._hand_profile["closed_value"],
+                "finger_order": self._hand_profile["order"],
+                "topic_out": [{"topic": self._node.topic, "format": "data/json"}],
+            }
         if action == "start":
             self.start()
             return {"state": "running"}
@@ -674,11 +714,13 @@ class HandPlugin:
     PREFIX = "hand"
 
     def __init__(self, plugin_config, _namespace, _executor, hand_pub=None, **_kwargs):
-        self._hand_type = str(plugin_config.get("hand_type", "inspire")).lower()
-        self._max_value = 1000 if self._hand_type == "pnd" else 1800
+        self._hand_type, self._hand_profile = _hand_profile(plugin_config)
+        self._max_value = self._hand_profile["max_value"]
+        self._open_value = self._hand_profile["open_value"]
+        self._closed_value = self._hand_profile["closed_value"]
         self._rate_hz = float(plugin_config.get("control_rate_hz", 400))
         self._hand_pub = hand_pub
-        self._target = [self._max_value] * 12
+        self._target = [self._open_value] * 12
         self._active = False
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -690,18 +732,22 @@ class HandPlugin:
             "name": "hand",
             "type": "actuator",
             "multiInstance": False,
-            "description": f"Adam hand control through DDS rt/handcmd (0=closed, {self._max_value}=open)",
+            "description": (
+                f"PND dexterous hand control via DDS rt/handcmd "
+                f"({self._open_value}=fully open, {self._closed_value}=fully closed; "
+                f"position range {self._hand_profile['position_range']})"
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["open", "close", "set_fingers"]},
-                    "left": {"type": "array", "items": {"type": "integer"}, "minItems": 6, "maxItems": 6, "description": "[pinky, ring, middle, index, thumb, lateral]"},
-                    "right": {"type": "array", "items": {"type": "integer"}, "minItems": 6, "maxItems": 6, "description": "[pinky, ring, middle, index, thumb, lateral]"},
+                    "left": {"type": "array", "items": {"type": "integer"}, "minItems": 6, "maxItems": 6, "description": f"[{self._hand_profile['order']}]"},
+                    "right": {"type": "array", "items": {"type": "integer"}, "minItems": 6, "maxItems": 6, "description": f"[{self._hand_profile['order']}]"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "open": {"params": [], "description": "Open all 12 fingers"},
-                    "close": {"params": [], "description": "Close all 12 fingers"},
+                    "open": {"params": [], "description": f"Fully open all 12 joints ({self._open_value})"},
+                    "close": {"params": [], "description": f"Fully close all 12 joints ({self._closed_value})"},
                     "set_fingers": {"params": ["left", "right"], "description": "Set all 12 finger positions"},
                 },
             },
@@ -763,11 +809,11 @@ class HandPlugin:
 
     def dispatch(self, action, args):
         if action == "open":
-            result = self._set_target([self._max_value] * 12)
+            result = self._set_target([self._open_value] * 12)
             result["message"] = "All fingers opened" if result.get("success") else result.get("message")
             return result
         if action == "close":
-            result = self._set_target([0] * 12)
+            result = self._set_target([self._closed_value] * 12)
             result["message"] = "All fingers closed" if result.get("success") else result.get("message")
             return result
         if action == "set_fingers":
@@ -785,7 +831,14 @@ class HandPlugin:
         if action == "info":
             with self._lock:
                 active = self._active
-            return {"state": "active" if active else "idle", "hand_type": self._hand_type}
+            return {
+                "state": "active" if active else "idle",
+                "hand_type": self._hand_type,
+                "position_range": self._hand_profile["position_range"],
+                "open_value": self._open_value,
+                "closed_value": self._closed_value,
+                "finger_order": self._hand_profile["order"],
+            }
         return None
 
 
