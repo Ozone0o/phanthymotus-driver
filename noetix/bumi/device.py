@@ -1164,8 +1164,8 @@ class SpeakerPlugin:
 
 _CAMERA_STATUS_PATH = Path(tempfile.gettempdir()) / "bumi_camera_status.json"
 _POINTCLOUD_CONTROL_PATH = Path(tempfile.gettempdir()) / "bumi_pointcloud_control"
-_CAMERA_PITCH_DEG = -20.0
-_CAMERA_ROLL_DEG = 0.0
+_CAMERA_PITCH_DEG = -10.263
+_CAMERA_ROLL_DEG = 0.853
 
 
 def _apply_camera_extrinsics(points, np):
@@ -1336,11 +1336,12 @@ def _camera_subprocess(namespace: str):
                     count = min(len(valid), max_points)
                     stride = max(1, len(valid) // count)
                     sampled = valid[::stride][:count]
-                    # RealSense optical frame (X right, Y down, Z forward)
-                    # to the AgentCore renderer frame used by Tianyi/G1.
+                    # Apply the physical camera mounting correction while the
+                    # points are still in the RealSense optical frame.
+                    sampled = _apply_camera_extrinsics(sampled, _np)
+                    # Then convert RealSense XYZ to the AgentCore/Tianyi frame.
                     # Keep `valid` unchanged below for distance statistics.
                     sampled = sampled[:, [2, 0, 1]]
-                    sampled = _apply_camera_extrinsics(sampled, _np)
                     blob = sampled.astype("<f4", copy=False).tobytes()
                     payload = struct.pack("<II", 12, len(sampled)) + blob
                     msg = _UInt8MultiArray()
