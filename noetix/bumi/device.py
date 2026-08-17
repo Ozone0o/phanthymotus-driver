@@ -1164,6 +1164,25 @@ class SpeakerPlugin:
 
 _CAMERA_STATUS_PATH = Path(tempfile.gettempdir()) / "bumi_camera_status.json"
 _POINTCLOUD_CONTROL_PATH = Path(tempfile.gettempdir()) / "bumi_pointcloud_control"
+_CAMERA_PITCH_DEG = -20.0
+_CAMERA_ROLL_DEG = 0.0
+
+
+def _apply_camera_extrinsics(points, np):
+    """Apply the fixed RealSense-to-Bumi mounting rotation for display only."""
+    pitch = math.radians(_CAMERA_PITCH_DEG)
+    roll = math.radians(_CAMERA_ROLL_DEG)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cr, sr = math.cos(roll), math.sin(roll)
+    pitch_matrix = np.array(
+        [[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]],
+        dtype=np.float32,
+    )
+    roll_matrix = np.array(
+        [[cr, -sr, 0.0], [sr, cr, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    return points @ (roll_matrix @ pitch_matrix).T
 
 
 def _write_camera_control(enabled: bool) -> None:
@@ -1321,6 +1340,7 @@ def _camera_subprocess(namespace: str):
                     # to the AgentCore renderer frame used by Tianyi/G1.
                     # Keep `valid` unchanged below for distance statistics.
                     sampled = sampled[:, [2, 0, 1]]
+                    sampled = _apply_camera_extrinsics(sampled, _np)
                     blob = sampled.astype("<f4", copy=False).tobytes()
                     payload = struct.pack("<II", 12, len(sampled)) + blob
                     msg = _UInt8MultiArray()
