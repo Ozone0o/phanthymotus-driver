@@ -13,7 +13,7 @@ import platform
 from typing import Any
 
 
-CARD = "bumi_firmware_info"
+CARD = "firmware_info"
 DRIVER_SDK_VERSION = "3.1.0"
 PROTOCOL_NAME = "Noetix HighController / ControlCmd"
 TEACHING_COMMANDS = ("STARTTEACH", "SAVETEACH", "PLAYTEACH", "WALK")
@@ -97,6 +97,10 @@ class FirmwareInfoPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if action == "start":
+            return {"state": "running", "read_only": True}
+        if action in ("stop", "disable"):
+            return {"state": "idle", "read_only": True}
         if action not in (CARD, "info", "read", "get"):
             return None
 
