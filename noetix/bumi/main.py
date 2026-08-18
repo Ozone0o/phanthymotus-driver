@@ -51,6 +51,10 @@ class BumiDeviceBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
+        from firmware_info import FirmwareInfoPlugin
+        self._plugins.append(FirmwareInfoPlugin(high_ctrl))
+        print("[bundle] FirmwareInfoPlugin loaded")
+
         if plugins_cfg.get("state", {}).get("enabled", False) and high_ctrl is not None:
             from device import StatePlugin
             self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor, high_ctrl))
