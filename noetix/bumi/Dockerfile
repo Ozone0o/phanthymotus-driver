@@ -67,6 +67,7 @@ COPY resource/ /work/resource/
 COPY main.py   /work/main.py
 COPY device.py /work/device.py
 COPY config.yaml /work/config.yaml
+COPY firmware_info.py /work/firmware_info.py
 COPY deploy/     /deploy/
 
 # Add SDK DDS libs + pybind modules to paths
