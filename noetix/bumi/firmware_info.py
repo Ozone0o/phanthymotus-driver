@@ -88,6 +88,7 @@ class FirmwareInfoPlugin:
             "multiInstance": False,
             "description": "Read-only Bumi firmware, SDK, protocol and compatibility information. No commands are sent to the robot.",
             "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [],
         }
 
     def start(self) -> None:
@@ -98,9 +99,9 @@ class FirmwareInfoPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
-            return {"state": "running", "read_only": True}
+            return {"state": "running", "read_only": True, "topic_out": []}
         if action in ("stop", "disable"):
-            return {"state": "idle", "read_only": True}
+            return {"state": "idle", "read_only": True, "topic_out": []}
         if action not in (CARD, "info", "read", "get"):
             return None
 
@@ -129,6 +130,7 @@ class FirmwareInfoPlugin:
         result = {
             "state": "completed",
             "read_only": True,
+            "topic_out": [],
             "main_firmware_version": firmware or "unknown",
             "motor_control_version": motor_firmware or "unknown",
             "hardware_model": hardware_model or os.environ.get("BUMI_HARDWARE_MODEL", "unknown"),
